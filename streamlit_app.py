@@ -1,96 +1,54 @@
+"""KONE Elevator Modernisation Energy Platform — prototype navigation."""
 import streamlit as st
+from ui_theme import apply_theme, heading, prototype_notice
 
+st.set_page_config(page_title="KONE | Modernisation Energy", page_icon="images/icon_blue.png", layout="wide")
+apply_theme()
+st.logo("images/horizontal_blue.png", icon_image="images/icon_blue.png")
 if "role" not in st.session_state:
     st.session_state.role = None
-
-ROLES = [None, "Requester", "Responder", "Admin"]
-
-
-def login():
-
-    st.header("Log in")
-    role = st.selectbox("Choose your role", ROLES)
-
-    if st.button("Log in"):
-        st.session_state.role = role
-        st.rerun()
-
 
 def logout():
     st.session_state.role = None
     st.rerun()
 
+def select_role():
+    heading("KONE · Engineering platform", "Elevator Modernisation Energy",
+            "Manage project requests, preserve EnerCal source reports and review estimated energy performance.")
+    st.info("Prototype role selection only. No verified authentication is provided.")
+    with st.form("select_role"):
+        chosen = st.radio("Choose a workspace", ["Requester", "Responder", "Admin"],
+                          captions=["Submit requests and follow their status.",
+                                    "Respond to requests and update statuses.",
+                                    "Manage cases and review EnerCal estimates."])
+        if st.form_submit_button("Continue to workspace", type="primary"):
+            st.session_state.role = chosen
+            st.rerun()
+    prototype_notice()
 
 role = st.session_state.role
-
-logout_page = st.Page(logout, title="Log out", icon=":material/logout:")
-settings = st.Page("settings.py", title="Settings", icon=":material/settings:")
-request_1 = st.Page(
-    "request/request_1.py",
-    title="Request 1",
-    icon=":material/help:",
-    default=(role == "Requester"),
-)
-request_2 = st.Page(
-    "request/request_2.py", title="Request 2", icon=":material/bug_report:"
-)
-respond_1 = st.Page(
-    "respond/respond_1.py",
-    title="Respond 1",
-    icon=":material/healing:",
-    default=(role == "Responder"),
-)
-respond_2 = st.Page(
-    "respond/respond_2.py", title="Respond 2", icon=":material/handyman:"
-)
-admin_1 = st.Page(
-    "admin/admin_1.py",
-    title="Admin 1",
-    icon=":material/person_add:",
-    default=(role == "Admin"),
-)
-admin_2 = st.Page("admin/admin_2.py", title="Admin 2", icon=":material/security:")
-
-enercal_upload = st.Page(
-    "enercal/enercal_upload.py",
-    title="Upload & Review",
-    icon=":material/upload_file:"
-)
-
-
-enercal_review = st.Page(
-    "enercal/enercal_review.py",
-    title="Engineering Review",
-    icon=":material/fact_check:"
-)
-
-
-account_pages = [logout_page, settings]
-request_pages = [request_1, request_2]
-respond_pages = [respond_1, respond_2]
-admin_pages = [admin_1, admin_2]
-
-st.title("Request manager")
-st.logo("images/horizontal_blue.png", icon_image="images/icon_blue.png")
-
-page_dict = {}
-if st.session_state.role in ["Requester", "Admin"]:
-    page_dict["Request"] = request_pages
-if st.session_state.role in ["Responder", "Admin"]:
-    page_dict["Respond"] = respond_pages
-if st.session_state.role == "Admin":
-    page_dict["Admin"] = admin_pages
-
-    page_dict["EnerCal"] = [
-        enercal_upload,
-        enercal_review
-    ]
-
-
-
-if len(page_dict) > 0:
-    pg = st.navigation({"Account": account_pages} | page_dict)
+if role is None:
+    st.navigation([st.Page(select_role, title="Select workspace", icon=":material/login:")]).run()
 else:
-    pg = st.navigation([st.Page(login)])
-
-pg.run()
+    dashboard = st.Page("dashboard.py", title="Dashboard", icon=":material/dashboard:", default=True)
+    request = st.Page("request/request_1.py", title="Submit & Track", icon=":material/edit_note:")
+    respond = st.Page("respond/respond_1.py", title="Response Inbox", icon=":material/mail:")
+    cases = st.Page("enercal/cases.py", title="Modernisation Cases", icon=":material/apartment:")
+    upload = st.Page("enercal/enercal_upload.py", title="Upload EnerCal PDF", icon=":material/upload_file:")
+    workspace = st.Page("enercal/enercal_review.py", title="Case Workspace", icon=":material/fact_check:")
+    future = st.Page("future_modules.py", title="Analytics & AI (Future)", icon=":material/monitoring:")
+    switch = st.Page(logout, title="Change prototype role", icon=":material/swap_horiz:")
+    navigation = {"Workspace": [dashboard]}
+    if role in ("Requester", "Admin"):
+        navigation["Requests"] = [request]
+    if role in ("Responder", "Admin"):
+        navigation.setdefault("Requests", []).append(respond)
+    if role == "Admin":
+        navigation["Engineering"] = [cases, upload, workspace]
+        navigation["Roadmap"] = [future]
+    navigation["Prototype"] = [switch]
+    with st.sidebar:
+        st.caption("ENERGY PLATFORM · PROTOTYPE")
+        st.markdown(f"**Workspace:** {role}")
+        prototype_notice()
+    st.navigation(navigation).run()
