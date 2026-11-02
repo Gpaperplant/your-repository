@@ -1,5 +1,6 @@
 import hashlib
 import re
+from decimal import Decimal, InvalidOperation
 
 import streamlit as st
 from psycopg.errors import UniqueViolation
@@ -130,10 +131,17 @@ def find_existing_document(case_ref, pdf_bytes):
 
 
 def format_number(value):
-    """Display a number or N/A."""
+    """Show exact stored numeric precision without rounding away decimals."""
     if value is None:
         return "N/A"
-    return f"{value:,.0f}"
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return str(value)
+    if not number.is_finite():
+        return "N/A"
+    display = format(number, ",f")
+    return display.rstrip("0").rstrip(".") if "." in display else display
 
 
 def build_preview_rows(comparison):
@@ -170,7 +178,7 @@ st.write(
 )
 
 if st.session_state.get("role") != "Admin":
-    st.error("Admin access is required.")
+    st.error("Admin access is required. Open this page from the main application after signing in.")
     st.stop()
 
 if "enercal_case_created" in st.session_state:
@@ -299,13 +307,20 @@ uploaded_file = st.file_uploader(
     key=f"enercal_pdf_upload_{case_ref}",
 )
 
+# Streamlit returns None until a user selects a file. Never read it before this check.
 if uploaded_file is None:
+    st.info("Select an EnerCal PDF to preview its calculated energy comparison.")
     st.stop()
 
 pdf_bytes = uploaded_file.getvalue()
 
 if not pdf_bytes:
     st.error("The uploaded PDF is empty.")
+    st.stop()
+
+# The file extension alone does not confirm a PDF; reject obvious wrong types.
+if not pdf_bytes.startswith(b"%PDF-"):
+    st.error("The selected file does not have a valid PDF header.")
     st.stop()
 
 if len(pdf_bytes) > 15 * 1024 * 1024:
@@ -407,14 +422,12 @@ if document_id is not None:
                     {
                         "Role": row[0].title(),
                         "Elevator Technology": row[1],
-                        "Annual Energy (kWh/year)": row[2],
-                        "Regenerative Energy (kWh/year)": (
-                            "N/A" if row[3] is None else row[3]
-                        ),
-                        "Annual Expenditure (BHD/year)": row[4],
-                        "Lifetime Expenditure (BHD)": row[5],
-                        "Operational CO2e (kg/lifetime)": row[6],
-                        "Embodied CO2e (kg)": row[7],
+                        "Annual Energy (kWh/year)": format_number(row[2]),
+                        "Regenerative Energy (kWh/year)": format_number(row[3]),
+                        "Annual Expenditure (BHD/year)": format_number(row[4]),
+                        "Lifetime Expenditure (BHD)": format_number(row[5]),
+                        "Operational CO2e (kg/lifetime)": format_number(row[6]),
+                        "Embodied CO2e (kg)": format_number(row[7]),
                     }
                     for row in stored_rows
                 ],
@@ -423,6 +436,6 @@ if document_id is not None:
             )
         else:
             st.warning(
-                "Document exists, but the complete comparison "
-                "has not yet been stored."
+                "Document exists, but the comparison view returned no rows. "
+                "Check that the extraction and view are complete."
             )

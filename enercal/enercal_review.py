@@ -1,4 +1,5 @@
 import altair as alt
+import pymupdf
 import pandas as pd
 import streamlit as st
 
@@ -33,9 +34,9 @@ STATUS_LABELS = {
 
 STATUS_GUIDANCE = {
     "pending": "Review the PDF and extracted values, then record an engineering decision.",
-    "changes_requested": "Corrections are requested. Update any incorrect values or submit a clarification if the values are already correct.",
-    "further_verification_required": "Additional checks are required. Submit supporting clarification, or correct any values that changed.",
-    "approved": "The extracted EnerCal values have been approved for reporting as simulation estimates.",
+    "changes_requested": "Follow-up required. Check the PDF below, then confirm or correct the extracted values.",
+    "further_verification_required": "Further checks are needed. Confirm the original values or submit corrections below.",
+    "approved": "The extracted EnerCal values have been approved for reporting as calculated estimates.",
     "rejected": "This extraction was finally rejected. Its original PDF and review history remain preserved.",
 }
 
@@ -47,20 +48,26 @@ def finish_action(message):
 
 
 def display_number(value):
-    """Readable numbers without hiding meaningful decimal places."""
+    """Format database numbers without silently rounding meaningful digits."""
     if value is None:
         return "N/A"
-    return f"{value:,.3f}".rstrip("0").rstrip(".")
+    try:
+        from decimal import Decimal, InvalidOperation
+
+        number = Decimal(str(value))
+        if not number.is_finite():
+            return "N/A"
+        return format(number, ",f").rstrip("0").rstrip(".") if "." in format(number, ",f") else format(number, ",f")
+    except (InvalidOperation, ValueError, TypeError):
+        return "N/A"
 
 
 def display_percent(value):
-    """Avoid displaying redundant zeros such as 55.390% or 55.000%."""
+    """Format percentages without discarding meaningful decimal places."""
     if value is None:
         return "N/A"
-    text = str(value).strip().rstrip("%")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return f"{text}%"
+    text = str(value).strip().removesuffix("%").strip()
+    return f"{display_number(text)}%" if text else "N/A"
 
 
 def status_message(status):
@@ -73,6 +80,76 @@ def status_message(status):
         st.warning(message)
     else:
         st.info(message)
+
+
+# =====================================================
+# PDF PAGE PREVIEW
+# =====================================================
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def pdf_page_info(pdf_bytes: bytes):
+    """Find the EnerCal comparison page without assuming it is always page 4."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
+        count = len(document)
+        if not count:
+            raise ValueError("The source PDF has no pages.")
+        comparison_page = 1
+        for page_index, page in enumerate(document):
+            text = page.get_text("text").upper()
+            if "EXISTING TECHNOLOGY COMPARISON" in text:
+                comparison_page = page_index + 1
+                break
+    return count, comparison_page
+
+
+@st.cache_data(show_spinner=False, max_entries=48)
+def render_source_page(pdf_bytes: bytes, page_number: int) -> bytes:
+    """Render the original PDF page as a PNG for the Streamlit viewer."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
+        if not 1 <= page_number <= len(document):
+            raise ValueError("The requested PDF page does not exist.")
+        page = document[page_number - 1]
+        pixmap = page.get_pixmap(dpi=155, alpha=False)
+        return pixmap.tobytes("png")
+
+
+def show_original_pdf_page(pdf_bytes: bytes, document_id, view_name: str):
+    """Show a page preview from the saved PDF without external PDF services."""
+    if not pdf_bytes:
+        st.warning("The original PDF is unavailable for preview.")
+        return
+
+    try:
+        page_count, comparison_page = pdf_page_info(pdf_bytes)
+    except Exception as error:
+        st.warning(f"Unable to read the original PDF: {error}")
+        return
+
+    selector_col, note_col = st.columns([1, 2], vertical_alignment="bottom")
+    with selector_col:
+        chosen_page = st.selectbox(
+            "Original PDF page",
+            options=range(1, page_count + 1),
+            index=comparison_page - 1,
+            key=f"enercal_pdf_page_{view_name}_{document_id}",
+            format_func=lambda page: f"Page {page} of {page_count}",
+        )
+    with note_col:
+        st.caption(
+            f"Comparison found on page {comparison_page}. "
+            "This is the original source PDF, not an edited revision."
+        )
+
+    try:
+        image_bytes = render_source_page(pdf_bytes, chosen_page)
+    except Exception as error:
+        st.warning(f"Could not display this PDF page: {error}")
+    else:
+        st.image(
+            image_bytes,
+            width="stretch",
+            caption=f"Original EnerCal source PDF · Page {chosen_page} of {page_count}",
+        )
 
 
 # =====================================================
@@ -149,6 +226,13 @@ if not valid_revision:
     )
     st.stop()
 
+if set(FIELD_LABELS) != EXPECTED_FIELDS:
+    st.error(
+        "The review field labels do not match the expected 16 extraction fields. "
+        "Check services/enercal_review_repository.py."
+    )
+    st.stop()
+
 # Page-level summary, visible regardless of the selected tab.
 # Use normal text for case reference and review status so long labels
 # such as "Further Verification Required" are never truncated by st.metric.
@@ -156,7 +240,7 @@ st.subheader("Case overview")
 summary_cols = st.columns([1.2, 0.7, 1.5], gap="large")
 with summary_cols[0]:
     st.caption("MODERNISATION CASE")
-    st.markdown(f"### {selected_case}")
+    st.subheader(str(selected_case))
 with summary_cols[1]:
     st.caption("CURRENT REVISION")
     st.markdown(f"### {revision_no}")
@@ -308,7 +392,7 @@ with overview_tab:
         st.warning("No comparison preview is available for this revision.")
 
     st.caption(
-        "Source: stored EnerCal PDF. These values are simulated estimates, "
+        "Source: stored EnerCal PDF. These values are calculated report estimates, "
         "not verified before-and-after meter measurements."
     )
 
@@ -319,8 +403,8 @@ with overview_tab:
 
 with document_tab:
     st.subheader("Original source document")
-    st.write(f"**File:** {details['filename']}")
-    st.write(f"**Document ID:** {document_id}")
+    st.write("**File:**", details["filename"])
+    st.write("**Document ID:**", document_id)
     st.download_button(
         "Download Original EnerCal PDF",
         data=details["pdf_bytes"],
@@ -332,6 +416,8 @@ with document_tab:
         "Compare the extracted values with the original PDF before "
         "making a review decision. The PDF is stored only once."
     )
+    with st.expander("Preview the original PDF here", expanded=False):
+        show_original_pdf_page(details["pdf_bytes"], document_id, "document")
 
     st.subheader("Extracted fields")
     field_filter = st.selectbox(
@@ -356,7 +442,7 @@ with document_tab:
             "Unit": candidate_lookup[name]["unit"] or "",
         }
         for name, label in FIELD_LABELS.items()
-        if included_field(name)
+        if name in candidate_lookup and included_field(name)
     ]
     st.dataframe(field_rows, hide_index=True, width="stretch")
     st.caption(
@@ -371,244 +457,315 @@ with document_tab:
 
 with review_tab:
     st.subheader("Engineering review")
-    st.write(
-        "Review the original PDF in the **PDF & Data** tab before "
-        "submitting a decision. All actions are recorded in the audit history."
+    st.caption(
+        "Check the source PDF and the 16 extracted values below. "
+        "Your decision and any corrections will be kept in History."
     )
 
-    if review_status == "pending":
-        with st.form(key=f"decision_{document_id}_{revision_no}"):
-            decision_options = {
-                "Approve Extraction": "approved",
-                "Request Changes": "changes_requested",
-                "Require Further Verification": "further_verification_required",
-                "Final Reject": "rejected",
-            }
-            selected_decision = st.radio(
-                "Engineering decision",
-                options=list(decision_options),
-                help="Final Reject closes the current extraction. Use Request Changes for correctable errors.",
-            )
-            review_note = st.text_area(
-                "Decision explanation",
-                placeholder="Explain the reason for corrections, verification, or final rejection.",
-            )
-            confirmed = st.checkbox(
-                "I have checked the 16 extracted fields against the original PDF."
-            )
-            submitted = st.form_submit_button(
-                "Save Engineering Decision", type="primary"
-            )
+    with st.expander("Original EnerCal PDF · Review the source page", expanded=True):
+        show_original_pdf_page(details["pdf_bytes"], document_id, "review")
 
-            if submitted:
-                decision = decision_options[selected_decision]
-                if not confirmed:
-                    st.error("Confirm the PDF check before proceeding.")
-                elif decision != "approved" and not review_note.strip():
-                    st.error("Enter a reason for this decision.")
-                else:
-                    try:
-                        result = review_revision(document_id, decision, review_note)
-                    except Exception as error:
-                        st.error(f"Unable to save decision: {error}")
-                    else:
-                        finish_action(
-                            f"Revision {result}: {STATUS_LABELS[decision]}. "
-                            "The decision was saved to review history."
-                        )
+    # Always show the complete current revision before asking for a decision.
+    # The derived saving cannot be edited directly.
+    table_rows = [
+        {
+            "Field": label,
+            "Extracted value": str(candidate_lookup[name]["raw_value"]),
+            "Unit": candidate_lookup[name]["unit"] or "—",
+        }
+        for name, label in FIELD_LABELS.items()
+    ]
+    st.markdown("#### Extracted values")
+    st.caption(f"Revision {revision_no} · {len(table_rows)} fields · Read-only")
+    st.dataframe(
+        pd.DataFrame(table_rows),
+        hide_index=True,
+        width="stretch",
+        height=600,
+        column_config={
+            "Field": st.column_config.TextColumn("Field", width="large"),
+            "Extracted value": st.column_config.TextColumn(
+                "Extracted value", width="medium"
+            ),
+            "Unit": st.column_config.TextColumn("Unit", width="medium"),
+        },
+    )
 
-    elif review_status in ("changes_requested", "further_verification_required"):
-        # This wizard is scoped to the PDF and revision. Selecting another
-        # document or creating a new revision starts at Step 1 automatically.
-        wizard_key = f"enercal_response_step_{document_id}_{revision_no}"
-        # Keep the choice independent of the temporary radio widget.
-        # Streamlit removes widget state when its widget disappears in Step 2.
-        choice_key = f"enercal_response_choice_{document_id}_{revision_no}"
-        radio_key = f"enercal_response_radio_{document_id}_{revision_no}"
-        current_step = st.session_state.get(wizard_key, 1)
+    if review_status in (
+        "pending",
+        "changes_requested",
+        "further_verification_required",
+    ):
+        # Key includes document and revision, so switching reports cannot carry
+        # an earlier decision into the next case.
+        mode_key = f"enercal_review_mode_{document_id}_{revision_no}"
+        if mode_key not in st.session_state:
+            st.session_state[mode_key] = None
 
-        if current_step == 1:
-            st.markdown("#### Step 1 of 2 · Check the extracted values")
-            st.write(
-                "Compare the extraction with the original EnerCal PDF in "
-                "the **PDF & Data** tab, then choose what needs to happen. "
-                "No database changes are made at this step."
-            )
-            response_options = [
-                "Confirm values are correct",
-                "Change extracted values",
-            ]
-            previous_choice = st.session_state.get(choice_key)
-            choice_index = (
-                response_options.index(previous_choice)
-                if previous_choice in response_options else None
-            )
-            selected_response = st.radio(
-                "Are the extracted values correct?",
-                options=response_options,
-                index=choice_index,
-                key=radio_key,
-                help=(
-                    "Confirm opens a clarification form. Change opens "
-                    "the field correction editor. Neither option approves the report."
-                ),
-            )
-            st.caption(
-                "**Confirm** means the values need no correction and you "
-                "will explain your checks. **Change** means at least one "
-                "extracted value needs correcting."
-            )
+        st.markdown("#### Are the extracted values correct?")
+        left, right = st.columns(2, gap="medium")
+        with left:
             if st.button(
-                "Next: Continue to details",
+                "✓ Values are correct",
                 type="primary",
-                key=f"enercal_response_next_{document_id}_{revision_no}",
+                width="stretch",
+                key=f"enercal_values_correct_{document_id}_{revision_no}",
             ):
-                if not selected_response:
-                    st.warning("Choose Confirm or Change before continuing.")
-                else:
-                    # This state is NOT linked to a disappearing Streamlit widget.
-                    st.session_state[choice_key] = selected_response
-                    st.session_state[wizard_key] = 2
-                    st.rerun()
-
-        else:
-            selection = st.session_state.get(choice_key)
-            if selection not in (
-                "Confirm values are correct",
-                "Change extracted values",
-            ):
-                # Handle an incomplete/cleared widget state safely.
-                st.session_state[wizard_key] = 1
-                st.rerun()
-
-            st.markdown("#### Step 2 of 2 · Submit your response")
+                st.session_state[mode_key] = "correct"
+        with right:
             if st.button(
-                "← Back to Confirm or Change",
-                key=f"enercal_response_back_{document_id}_{revision_no}",
+                "✎ Values need correction",
+                width="stretch",
+                key=f"enercal_values_wrong_{document_id}_{revision_no}",
             ):
-                st.session_state[wizard_key] = 1
-                st.rerun()
+                st.session_state[mode_key] = "edit"
 
-            if selection == "Confirm values are correct":
-                st.info(
-                    "The values will remain unchanged. Submit a documented "
-                    "clarification to return this **same revision** to Pending "
-                    "for a new engineering decision. This does not approve it."
+        mode = st.session_state.get(mode_key)
+
+        if mode == "correct":
+            st.divider()
+            if review_status == "pending":
+                st.markdown("##### Approve this extraction")
+                st.caption(
+                    "This approves the extracted EnerCal report values only. "
+                    "It does not verify measured energy savings."
                 )
-                with st.form(key=f"clarification_{document_id}_{revision_no}"):
-                    explanation = st.text_area(
-                        "Verification explanation",
-                        placeholder=(
-                            "What was checked against the PDF, and why "
-                            "are the existing values correct?"
+            else:
+                st.markdown("##### Confirm the existing values")
+                st.caption(
+                    "The report currently requires follow-up. Confirming its values "
+                    "will return it to Pending for another engineering decision. "
+                    "This confirmation does not approve the report."
+                )
+
+            with st.form(f"enercal_correct_form_{document_id}_{revision_no}"):
+                if review_status == "pending":
+                    explanation = st.text_input(
+                        "Review note (optional)",
+                        placeholder="Optional notes about your check",
+                    )
+                else:
+                    explanation = st.text_input(
+                        "Reason no correction is needed (required)",
+                        placeholder="For example, I rechecked the flagged values against the original PDF.",
+                        help=(
+                            "A brief explanation is needed in the audit history "
+                            "before this report can return to Pending."
                         ),
                     )
-                    confirmed = st.checkbox(
-                        "I confirm the extracted values do not require correction."
-                    )
-                    submitted = st.form_submit_button(
-                        "Submit Clarification", type="primary"
-                    )
-                    if submitted:
-                        if not confirmed:
-                            st.error("Confirm that no values need to change.")
-                        elif not explanation.strip():
-                            st.error("A verification explanation is required.")
-                        else:
-                            try:
-                                result = submit_verification(document_id, explanation)
-                            except Exception as error:
-                                st.error(f"Unable to submit clarification: {error}")
-                            else:
-                                finish_action(
-                                    f"Revision {result} returned to Pending. "
-                                    "No extra extraction fields were created."
-                                )
-
-            else:
-                st.info(
-                    "Edit only the **Corrected Value** column for the 15 "
-                    "source fields. Calculated Saving is the 16th field and "
-                    "will be recalculated by Python. A new revision is "
-                    "created only if a value really changes."
+                confirmed = st.checkbox(
+                    "I checked all 16 extracted fields against the original PDF."
                 )
-                editor_rows = [
-                    {
-                        "Field Name": name,
-                        "Field": label,
-                        "Original Value": candidate_lookup[name]["raw_value"],
-                        "Corrected Value": candidate_lookup[name]["raw_value"],
-                    }
-                    for name, label in FIELD_LABELS.items()
-                    if name != CALCULATED_FIELD
-                ]
-                editor_df = pd.DataFrame(editor_rows)
+                button_text = (
+                    "Confirm and approve extraction"
+                    if review_status == "pending"
+                    else "Confirm values for re-review"
+                )
+                submitted = st.form_submit_button(button_text, type="primary")
 
-                with st.form(key=f"correction_{document_id}_{revision_no}"):
-                    corrected_df = st.data_editor(
-                        editor_df,
-                        hide_index=True,
-                        num_rows="fixed",
-                        width="stretch",
-                        disabled=[
-                            "Field Name",
-                            "Field",
-                            "Original Value",
-                        ],
-                        column_config={
-                            "Field Name": None,
-                            "Corrected Value": st.column_config.TextColumn(
-                                "Corrected Value", help="Enter a corrected value."
-                            ),
-                        },
-                        key=f"enercal_editor_{document_id}_{revision_no}",
-                    )
-                    correction_note = st.text_area(
-                        "Correction explanation",
-                        placeholder="Which field did you correct and why?",
-                    )
-                    confirmed = st.checkbox(
-                        "I have checked the corrected values against the original PDF."
-                    )
-                    submitted = st.form_submit_button(
-                        f"Submit as Revision {revision_no + 1}", type="primary"
-                    )
-
-                    if submitted:
-                        corrected_values = {
-                            row["Field Name"]: str(row["Corrected Value"])
-                            for _, row in corrected_df.iterrows()
-                        }
-                        # Backend recalculates this field; it is never editable.
-                        corrected_values[CALCULATED_FIELD] = candidate_lookup[
-                            CALCULATED_FIELD
-                        ]["raw_value"]
-                        if not confirmed:
-                            st.error("Confirm the corrections have been checked.")
-                        elif not correction_note.strip():
-                            st.error("A correction explanation is required.")
+                if submitted:
+                    if not confirmed:
+                        st.error("Please confirm that the PDF values were checked.")
+                    elif review_status != "pending" and not explanation.strip():
+                        st.error("Briefly explain why no correction is needed before submitting.")
+                    else:
+                        try:
+                            if review_status == "pending":
+                                result = review_revision(
+                                    document_id, "approved", explanation.strip()
+                                )
+                                message = (
+                                    f"Revision {result} approved as an EnerCal "
+                                    "calculated estimate."
+                                )
+                            else:
+                                result = submit_verification(
+                                    document_id, explanation.strip()
+                                )
+                                message = (
+                                    f"Revision {result} returned to Pending for "
+                                    "engineering re-review."
+                                )
+                        except Exception as error:
+                            st.error(f"Could not save review: {error}")
                         else:
+                            finish_action(message)
+
+        elif mode == "edit":
+            st.divider()
+            st.markdown("##### Correct extracted values")
+            st.caption(
+                "Edit only the Corrected value cells that are wrong. "
+                "Calculated saving is excluded because the backend recalculates it "
+                "from the two annual energy values."
+            )
+
+            editor_rows = [
+                {
+                    "Field key": name,
+                    "Field": label,
+                    "Original value": str(candidate_lookup[name]["raw_value"]),
+                    "Corrected value": str(candidate_lookup[name]["raw_value"]),
+                }
+                for name, label in FIELD_LABELS.items()
+                if name != CALCULATED_FIELD
+            ]
+            editor_df = pd.DataFrame(editor_rows)
+
+            with st.form(f"enercal_edit_form_{document_id}_{revision_no}"):
+                edited_df = st.data_editor(
+                    editor_df,
+                    hide_index=True,
+                    num_rows="fixed",
+                    width="stretch",
+                    height=580,
+                    disabled=["Field key", "Field", "Original value"],
+                    column_config={
+                        "Field key": None,
+                        "Field": st.column_config.TextColumn("Field", width="large"),
+                        "Original value": st.column_config.TextColumn(
+                            "Original value", width="medium"
+                        ),
+                        "Corrected value": st.column_config.TextColumn(
+                            "Corrected value", width="medium",
+                            help="Edit only values that differ from the source PDF.",
+                        ),
+                    },
+                    key=f"enercal_editor_{document_id}_{revision_no}",
+                )
+
+                correction_note = st.text_area(
+                    "Correction explanation",
+                    placeholder="Describe which values were corrected and why.",
+                    height=100,
+                )
+                confirmed = st.checkbox(
+                    "I checked the corrected values against the original PDF.",
+                    key=f"enercal_correction_confirm_{document_id}_{revision_no}",
+                )
+                submitted = st.form_submit_button(
+                    "Submit corrected values", type="primary"
+                )
+
+                if submitted:
+                    corrected_values = {
+                        row["Field key"]: str(row["Corrected value"]).strip()
+                        for _, row in edited_df.iterrows()
+                    }
+                    # Backend recalculates this field and validates its value.
+                    corrected_values[CALCULATED_FIELD] = candidate_lookup[
+                        CALCULATED_FIELD
+                    ]["raw_value"]
+
+                    changed_fields = [
+                        name
+                        for name in corrected_values
+                        if name != CALCULATED_FIELD
+                        and str(corrected_values[name]).strip()
+                        != str(candidate_lookup[name]["raw_value"]).strip()
+                    ]
+
+                    if not changed_fields:
+                        st.error(
+                            "No values were changed. Select 'Values are correct' "
+                            "to confirm the original extraction instead."
+                        )
+                    elif any(
+                        not str(corrected_values[name]).strip()
+                        for name in changed_fields
+                    ):
+                        st.error("Corrected values cannot be empty.")
+                    elif not correction_note.strip():
+                        st.error("Please explain what was corrected.")
+                    elif not confirmed:
+                        st.error("Please confirm that you checked the corrections.")
+                    else:
+                        # The existing repository supports resubmission after a
+                        # changes_requested or verification-required decision.
+                        # For a Pending revision, record that decision first.
+                        # If resubmission fails, the document remains in
+                        # changes_requested and the reviewer can retry safely.
+                        if review_status == "pending":
                             try:
-                                result = resubmit_revision(
-                                    document_id, corrected_values, correction_note
+                                review_revision(
+                                    document_id,
+                                    "changes_requested",
+                                    correction_note.strip(),
                                 )
                             except Exception as error:
-                                st.error(f"Unable to submit corrections: {error}")
+                                st.error(
+                                    "Could not initiate the correction workflow: "
+                                    f"{error}"
+                                )
+                                st.stop()
+
+                        try:
+                            result = resubmit_revision(
+                                document_id,
+                                corrected_values,
+                                correction_note.strip(),
+                            )
+                        except Exception as error:
+                            st.error(f"Could not submit corrections: {error}")
+                            if review_status == "pending":
+                                st.warning(
+                                    "The report may now be marked Changes Requested. "
+                                    "Refresh the page and retry the corrections."
+                                )
+                        else:
+                            finish_action(
+                                f"Revision {result} created as Pending. "
+                                f"{len(changed_fields)} field(s) updated; "
+                                "the previous revision remains in History."
+                            )
+
+        # These are not the main path and stay collapsed to avoid clutter.
+        if review_status == "pending":
+            with st.expander("Other review decisions"):
+                st.caption(
+                    "Use these only when the report cannot be approved or "
+                    "corrected from the available evidence."
+                )
+                with st.form(f"enercal_other_decisions_{document_id}_{revision_no}"):
+                    decision = st.selectbox(
+                        "Decision",
+                        ["Require further verification", "Final rejection"],
+                    )
+                    reason = st.text_area(
+                        "Reason (required)",
+                        placeholder="Explain the unresolved issue or final rejection.",
+                    )
+                    submitted = st.form_submit_button("Record decision")
+                    if submitted:
+                        if not reason.strip():
+                            st.error("A reason is required.")
+                        else:
+                            target = (
+                                "further_verification_required"
+                                if decision == "Require further verification"
+                                else "rejected"
+                            )
+                            try:
+                                result = review_revision(
+                                    document_id, target, reason.strip()
+                                )
+                            except Exception as error:
+                                st.error(f"Could not record decision: {error}")
                             else:
                                 finish_action(
-                                    f"Revision {result} created as Pending. "
-                                    f"Revision {revision_no} remains in history."
+                                    f"Revision {result}: {STATUS_LABELS[target]}. "
+                                    "The decision was recorded in History."
                                 )
 
     elif review_status == "approved":
         st.success(
-            f"Revision {revision_no} is approved. It is eligible for approved "
-            "EnerCal estimate reporting, not measured-savings verification."
+            "This revision has been approved for EnerCal calculated estimate "
+            "reporting. It is not a verified measured energy savings result."
         )
     elif review_status == "rejected":
         st.error(
-            f"Revision {revision_no} was finally rejected. "
-            "Review history and the PDF are preserved."
+            "This revision was finally rejected. Its source PDF and review "
+            "history have been preserved."
         )
     else:
         st.error(f"Unknown review status: {review_status}")
