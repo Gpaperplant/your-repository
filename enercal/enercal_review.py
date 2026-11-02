@@ -9,6 +9,7 @@ from services.enercal_review_repository import (
     FIELD_LABELS,
     get_review_details,
     get_review_documents,
+    get_specifications,
     resubmit_revision,
     review_revision,
     submit_verification,
@@ -449,6 +450,14 @@ with document_tab:
         f"Showing {len(field_rows)} of {len(EXPECTED_FIELDS)} fields "
         f"from revision {revision_no}."
     )
+
+    # Display additional engineering fields without changing the approval form.
+    with st.expander("Additional engineering specifications (unreviewed)"):
+        extra_fields = get_specifications(document_id)
+        if extra_fields:
+            st.dataframe(extra_fields, hide_index=True, width="stretch")
+        else:
+            st.info("No additional specifications stored for this report.")
 
 
 # =====================================================

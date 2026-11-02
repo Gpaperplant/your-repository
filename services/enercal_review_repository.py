@@ -832,3 +832,25 @@ def resubmit_revision(
             )
 
     return new_revision_no
+
+def get_specifications(document_id):
+    # Keep optional PDF specifications independent from approved comparison fields.
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT field_name, field_value, unit, source_page
+            FROM enercal_specifications
+            WHERE document_id = %s
+            ORDER BY source_page, field_name
+            """,
+            (document_id,),
+        )
+        return [
+            {
+                "Field": name.replace("_", " ").capitalize(),
+                "Value": value,
+                "Unit": unit or "",
+                "Source page": page,
+            }
+            for name, value, unit, page in cur.fetchall()
+        ]
