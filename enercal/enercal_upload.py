@@ -10,6 +10,12 @@ from services.enercal_extractor import extract_full_energy_comparison
 from services.enercal_repository import save_complete_enercal_report
 
 
+@st.cache_data(show_spinner=False, max_entries=4)
+def preview_energy_comparison(pdf_bytes):
+    # Avoid re-extracting an unchanged PDF on Streamlit reruns.
+    return extract_full_energy_comparison(pdf_bytes)
+
+
 # -----------------------------------------------------
 # Database helpers
 # -----------------------------------------------------
@@ -328,7 +334,7 @@ if len(pdf_bytes) > 15 * 1024 * 1024:
     st.stop()
 
 try:
-    comparison = extract_full_energy_comparison(pdf_bytes)
+    comparison = preview_energy_comparison(pdf_bytes)
 except Exception as error:
     st.error(f"PDF extraction failed: {error}")
     st.stop()

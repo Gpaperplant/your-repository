@@ -2,6 +2,7 @@ import hashlib
 from decimal import Decimal
 
 from database import get_connection
+from services.enercal_specs import extract_specs
 
 from services.enercal_extractor import (
     extract_pdf_text,
@@ -370,6 +371,7 @@ def save_complete_enercal_report(case_ref, filename, pdf_bytes):
     # Extract everything before opening a database transaction
     pages = extract_pdf_text(pdf_bytes)
     comparison = extract_full_energy_comparison(pdf_bytes)
+    specs = extract_specs(pdf_bytes)
 
     # Identify identical files by their SHA-256 fingerprint
     file_hash = hashlib.sha256(pdf_bytes).hexdigest()
@@ -476,6 +478,17 @@ def save_complete_enercal_report(case_ref, filename, pdf_bytes):
 
                 page_ids[page["page_number"]] = cur.fetchone()[0]
 
+            # Store extra fields separately from the 16 reviewed comparison fields.
+            if specs:
+                cur.executemany(
+                    """
+                    INSERT INTO enercal_specifications
+                        (document_id, field_name, field_value, unit, source_page)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    [(document_id, *field) for field in specs],
+                )
+
             # Link comparison fields to their source page
             page_id = page_ids[comparison["source_page"]]
 
@@ -523,34 +536,20 @@ def save_complete_enercal_report(case_ref, filename, pdf_bytes):
                     "Expected exactly 16 EnerCal comparison fields."
                 )
 
-            # Save all 16 values under Revision 1
-            for field_name, raw_value, number, unit in candidates:
-                cur.execute(
-                    """
-                    INSERT INTO extraction_candidates (
-                        page_id,
-                        field_name,
-                        raw_value,
-                        numeric_value,
-                        unit,
-                        revision_no,
-                        extraction_revision_id,
-                        review_status
-                    )
-                    VALUES (
-                        %s, %s, %s, %s,
-                        %s, 1, %s, 'pending'
-                    )
-                    """,
-                    (
-                        page_id,
-                        field_name,
-                        raw_value,
-                        number,
-                        unit,
-                        revision_id
-                    )
+            # Save all 16 review fields with a single batch operation.
+            cur.executemany(
+                """
+                INSERT INTO extraction_candidates (
+                    page_id, field_name, raw_value, numeric_value,
+                    unit, revision_no, extraction_revision_id, review_status
                 )
+                VALUES (%s, %s, %s, %s, %s, 1, %s, 'pending')
+                """,
+                [
+                    (page_id, name, raw_value, number, unit, revision_id)
+                    for name, raw_value, number, unit in candidates
+                ],
+            )
 
             # Record the original upload as a review-history event.
             # It belongs to Revision 1, not to 16 separate candidates.
