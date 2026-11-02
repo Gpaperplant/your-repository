@@ -51,6 +51,20 @@ admin_1 = st.Page(
 )
 admin_2 = st.Page("admin/admin_2.py", title="Admin 2", icon=":material/security:")
 
+enercal_upload = st.Page(
+    "enercal/enercal_upload.py",
+    title="Upload & Review",
+    icon=":material/upload_file:"
+)
+
+
+enercal_review = st.Page(
+    "enercal/enercal_review.py",
+    title="Engineering Review",
+    icon=":material/fact_check:"
+)
+
+
 account_pages = [logout_page, settings]
 request_pages = [request_1, request_2]
 respond_pages = [respond_1, respond_2]
@@ -66,6 +80,13 @@ if st.session_state.role in ["Responder", "Admin"]:
     page_dict["Respond"] = respond_pages
 if st.session_state.role == "Admin":
     page_dict["Admin"] = admin_pages
+
+    page_dict["EnerCal"] = [
+        enercal_upload,
+        enercal_review
+    ]
+
+
 
 if len(page_dict) > 0:
     pg = st.navigation({"Account": account_pages} | page_dict)
