@@ -1,3 +1,4 @@
+
 [project]
 name = "blank-app-template"
 version = "0.1.0"
@@ -8,6 +9,7 @@ dependencies = [
     "psycopg[binary]>=3.3.6",
     "pymupdf>=2.0",
     "python-dotenv>=1.2.4",
+    "rapidfuzz>=3.14.3",
     "streamlit>=1.36.0",
 ]
 

@@ -8,6 +8,7 @@ from services.enercal_extractor import (
     extract_energy_comparison,
     extract_full_energy_comparison,
 )
+from services.enercal_specs import extract_specs
 
 
 
@@ -367,9 +368,10 @@ def save_complete_enercal_report(case_ref, filename, pdf_bytes):
     if not pdf_bytes:
         raise ValueError("The PDF file is empty.")
 
-    # Extract everything before opening a database transaction
+    # Extract all report data before saving.
     pages = extract_pdf_text(pdf_bytes)
     comparison = extract_full_energy_comparison(pdf_bytes)
+    specs = extract_specs(pdf_bytes)
 
     # Identify identical files by their SHA-256 fingerprint
     file_hash = hashlib.sha256(pdf_bytes).hexdigest()
@@ -475,6 +477,25 @@ def save_complete_enercal_report(case_ref, filename, pdf_bytes):
                 )
 
                 page_ids[page["page_number"]] = cur.fetchone()[0]
+  
+            # Save additional EnerCal fields and cross-page checks.
+            if specs:
+                cur.executemany(
+                    """
+                    INSERT INTO enercal_specifications (
+                        document_id,
+                        field_name,
+                        field_value,
+                        unit,
+                        source_page
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    [
+                        (document_id, *field)
+                        for field in specs
+                    ],
+                )
 
             # Link comparison fields to their source page
             page_id = page_ids[comparison["source_page"]]
@@ -575,9 +596,10 @@ def save_complete_enercal_report(case_ref, filename, pdf_bytes):
             )
 
     return {
-        "document_id": document_id,
-        "pages_saved": len(pages),
-        "fields_saved": len(candidates)
+    "document_id": document_id,
+    "pages_saved": len(pages),
+    "fields_saved": len(candidates),
+    "additional_fields_saved": len(specs),
     }
 
 
