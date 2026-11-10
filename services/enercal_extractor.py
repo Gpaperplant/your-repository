@@ -1,128 +1,14 @@
-import pymupdf
+
+"""Extract the comparison from KONE's 12-page EnerCal MOD report."""
+
 import re
-from decimal import Decimal
+import unicodedata
+from decimal import Decimal, ROUND_HALF_UP
+
+import pymupdf
 
 
-def extract_pdf_text(pdf_bytes: bytes) -> list[dict]:
-    """
-    Read a PDF and return its text page by page.
-
-    Each result contains:
-    - page_number: page number starting from 1
-    - extracted_text: text extracted from that page
-    """
-
-    results = []
-
-    with pymupdf.open(
-        stream=pdf_bytes,
-        filetype="pdf"
-    ) as document:
-
-        for page_index in range(len(document)):
-
-            page = document[page_index]
-
-            text = page.get_text(
-                "text",
-                sort=True
-            )
-
-            results.append({
-                "page_number": page_index + 1,
-                "extracted_text": text
-            })
-
-    return results
-
-
-def extract_energy_comparison(pages: list[dict]) -> dict:
-    """
-    Identify calculated annual energy consumption
-    for the existing and proposed elevators.
-
-    This function is designed for the current
-    EnerCal report layout.
-    """
-
-    for page in pages:
-        text = page["extracted_text"]
-
-        # Find the relevant EnerCal comparison table
-        if (
-            "EXISTING TECHNOLOGY COMPARISON" not in text.upper()
-            or "ANNUAL ENERGY" not in text.upper()
-        ):
-            continue
-
-        # Locate the existing elevator row
-        existing_match = re.search(
-            r"(?im)^[ \t]*Typical[ \t]+Traction[^\n]*",
-            text
-        )
-
-        # Locate the proposed modernisation row
-        proposed_match = re.search(
-            r"(?im)^[ \t]*KONE[ \t]+N[ \t]+MonoSpace[^\n]*",
-            text
-        )
-
-        if not existing_match or not proposed_match:
-            raise ValueError(
-                "Could not identify both elevator rows."
-            )
-
-        # Extract the first number from each row
-        existing_numbers = re.findall(
-            r"\b\d+(?:,\d{3})*(?:\.\d+)?\b",
-            existing_match.group()
-        )
-
-        proposed_numbers = re.findall(
-            r"\b\d+(?:,\d{3})*(?:\.\d+)?\b",
-            proposed_match.group()
-        )
-
-        if not existing_numbers or not proposed_numbers:
-            raise ValueError(
-                "Annual energy values were not found."
-            )
-
-        baseline = float(
-            existing_numbers[0].replace(",", "")
-        )
-
-        proposed = float(
-            proposed_numbers[0].replace(",", "")
-        )
-
-        if baseline <= 0 or proposed < 0:
-            raise ValueError("Invalid energy values.")
-
-        savings_percent = (
-            (baseline - proposed) / baseline
-        ) * 100
-
-        return {
-            "baseline_annual_energy_kwh": baseline,
-            "proposed_annual_energy_kwh": proposed,
-            "calculated_saving_percent": round(
-                savings_percent, 2
-            ),
-            "source_page": page["page_number"],
-            "review_status": "pending"
-        }
-
-    raise ValueError(
-        "EnerCal energy comparison table not found."
-    )
-
-
-
-
-
-# Six columns from the EnerCal comparison table
-FULL_COMPARISON_FIELDS = (
+COMPARISON_FIELDS = (
     "annual_energy_consumption",
     "annual_regenerative_energy",
     "annual_electricity_expenditure",
@@ -131,186 +17,122 @@ FULL_COMPARISON_FIELDS = (
     "embodied_co2e",
 )
 
-# Column positions for this EnerCal PDF layout
-COLUMN_BOUNDS = (178, 285, 415, 540, 670, 805, 925)
+# Boundaries of the six numeric columns in the 792-point report.
+COLUMN_BOUNDS = (153, 239, 339, 434, 531, 634, 745)
+
+
+def _parse_comparison(page):
+    """Read the existing/proposed rows on page 4."""
+    if abs(page.rect.width - 792) > 1 or abs(page.rect.height - 632) > 1:
+        raise ValueError("Unsupported MOD PDF page dimensions.")
+
+    text = unicodedata.normalize("NFKC", page.get_text("text"))
+    if "EXISTING TECHNOLOGY COMPARISON" not in text.upper():
+        raise ValueError("MOD comparison heading not found on page 4.")
+
+    words = page.get_text("words")
+    headers = [
+        word for word in words
+        if word[4] == "Technology" and word[0] < COLUMN_BOUNDS[0]
+        and 300 < word[1] < 365
+    ]
+    if len(headers) != 1:
+        raise ValueError("Cannot locate the comparison table header.")
+
+    header_y = headers[0][1]
+    energy_words = sorted(
+        (
+            word for word in words
+            if COLUMN_BOUNDS[0] <= (word[0] + word[2]) / 2 < COLUMN_BOUNDS[1]
+            and header_y + 8 < word[1] < header_y + 95
+            and re.fullmatch(r"\d[\d,]*(?:\.\d+)?", word[4])
+        ),
+        key=lambda word: word[1],
+    )
+    if len(energy_words) != 2:
+        raise ValueError("Expected exactly two elevator rows on page 4.")
+
+    rows = {}
+    for role, anchor in zip(("existing", "proposed"), energy_words):
+        row_words = [word for word in words if abs(word[1] - anchor[1]) <= 15]
+        technology = " ".join(
+            word[4] for word in sorted(
+                (word for word in row_words if word[0] < COLUMN_BOUNDS[0]),
+                key=lambda word: (word[1], word[0]),
+            )
+        )
+        if not technology:
+            raise ValueError(f"Missing {role} elevator technology.")
+
+        values = []
+        for left, right in zip(COLUMN_BOUNDS[:-1], COLUMN_BOUNDS[1:]):
+            cell = [
+                word[4] for word in row_words
+                if left <= (word[0] + word[2]) / 2 < right
+            ]
+            if len(cell) != 1 or not re.fullmatch(r"N/A|\d[\d,]*(?:\.\d+)?", cell[0]):
+                raise ValueError(f"Invalid {role} comparison cell: {cell}.")
+            values.append(None if cell[0] == "N/A" else Decimal(cell[0].replace(",", "")))
+
+        rows[role] = {
+            "elevator_technology": technology,
+            **dict(zip(COMPARISON_FIELDS, values)),
+        }
+
+    saving_words = [
+        word[4] for word in words
+        if word[0] > 500
+        and energy_words[1][1] + 10 < word[1] < energy_words[1][1] + 60
+        and re.fullmatch(r"\d+(?:\.\d+)?%", word[4])
+    ]
+    currency_options = set(re.findall(r"\[([^/\]\s]+)/(?:year|lifetime)\]", text)) - {"kWh"}
+    lifetime = re.search(r"\[kgCO2e/lifetime\s*(\d+)\s*years\]", text)
+    if len(saving_words) != 1 or len(currency_options) != 1 or not lifetime:
+        raise ValueError("Missing savings, currency, or lifetime on page 4.")
+
+    existing = rows["existing"]["annual_energy_consumption"]
+    proposed = rows["proposed"]["annual_energy_consumption"]
+    if existing is None or existing <= 0 or proposed is None or proposed < 0:
+        raise ValueError("Invalid annual energy values.")
+
+    return {
+        "source_page": 4,
+        "rows": rows,
+        "currency_symbol": currency_options.pop(),
+        "lifetime_years": int(lifetime.group(1)),
+        "reported_energy_saving_percent": Decimal(saving_words[0][:-1]),
+        "calculated_energy_saving_percent": (
+            (existing - proposed) / existing * 100
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+    }
+
+
+def _page_texts(pdf):
+    return [
+        {"page_number": index + 1, "extracted_text": page.get_text("text", sort=True)}
+        for index, page in enumerate(pdf)
+    ]
 
 
 def extract_full_energy_comparison(pdf_bytes):
-    """Extract the complete EnerCal comparison on page 4."""
+    """Extract the 16 comparison fields from one MOD PDF."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as pdf:
+        if len(pdf) != 12:
+            raise ValueError("Expected a 12-page EnerCal MOD PDF.")
+        return _parse_comparison(pdf[3])
 
-    with pymupdf.open(
-        stream=pdf_bytes,
-        filetype="pdf"
-    ) as document:
 
-        for page_index, page in enumerate(document):
+def extract_pdf_text(pdf_bytes):
+    """Return page text for database storage."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as pdf:
+        return _page_texts(pdf)
 
-            text = page.get_text("text").upper()
 
-            # Locate the comparison page
-            if (
-                "EXISTING TECHNOLOGY COMPARISON"
-                not in text
-            ):
-                continue
-
-            # Reject unexpected layouts
-            if abs(page.rect.width - 960) > 25:
-                raise ValueError(
-                    "Unexpected EnerCal PDF layout."
-                )
-
-            words = page.get_text("words")
-            positions = {}
-            results = {}
-
-            # Identify the start of both elevator rows
-            for role, first_word in (
-                ("existing", "Typical"),
-                ("proposed", "KONE")
-            ):
-
-                matches = [
-                    w for w in words
-                    if w[4] == first_word
-                    and w[0] < 170
-                    and 350 < w[1] < 435
-                ]
-
-                if len(matches) != 1:
-                    raise ValueError(
-                        f"Cannot identify {role} elevator."
-                    )
-
-                positions[role] = matches[0][1]
-
-            # Read the two rows
-            for role in ("existing", "proposed"):
-
-                y = positions[role]
-
-                row_words = [
-                    w for w in words
-                    if y - 1 <= w[1] <= y + 28
-                ]
-
-                # Extract the elevator technology name
-                name_words = [
-                    w for w in row_words
-                    if w[0] < COLUMN_BOUNDS[0]
-                ]
-
-                technology = " ".join(
-                    w[4] for w in sorted(
-                        name_words,
-                        key=lambda w: (
-                            round(w[1], 1),
-                            w[0]
-                        )
-                    )
-                )
-
-                values = []
-
-                # Extract the six numerical columns
-                for left, right in zip(
-                    COLUMN_BOUNDS[:-1],
-                    COLUMN_BOUNDS[1:]
-                ):
-
-                    cell_words = [
-                        w for w in row_words
-                        if left <= (w[0] + w[2]) / 2 < right
-                    ]
-
-                    raw = " ".join(
-                        w[4] for w in sorted(
-                            cell_words,
-                            key=lambda w: w[0]
-                        )
-                    ).strip()
-
-                    if raw.upper() == "N/A":
-                        number = None
-
-                    elif re.fullmatch(
-                        r"\d[\d,]*(?:\.\d+)?",
-                        raw
-                    ):
-                        number = Decimal(
-                            raw.replace(",", "")
-                        )
-
-                    else:
-                        raise ValueError(
-                            f"Unexpected {role} value: {raw!r}"
-                        )
-
-                    values.append(number)
-
-                if not technology:
-                    raise ValueError(
-                        f"Missing {role} elevator name."
-                    )
-
-                results[role] = {
-                    "elevator_technology": technology,
-                    **dict(zip(
-                        FULL_COMPARISON_FIELDS,
-                        values
-                    ))
-                }
-
-            # Read the 55% displayed on the PDF
-            percentages = [
-                w[4] for w in words
-                if 700 < w[0] < 870
-                and positions["proposed"] + 25
-                    <= w[1]
-                    <= positions["proposed"] + 85
-                and re.fullmatch(
-                    r"\d+(?:\.\d+)?%",
-                    w[4]
-                )
-            ]
-
-            if len(percentages) != 1:
-                raise ValueError(
-                    "Reported energy saving not found."
-                )
-
-            # Recalculate savings from energy values
-            before = results["existing"][
-                "annual_energy_consumption"
-            ]
-
-            after = results["proposed"][
-                "annual_energy_consumption"
-            ]
-
-            if (
-                before is None or before <= 0
-                or after is None or after < 0
-            ):
-                raise ValueError(
-                    "Invalid energy consumption values."
-                )
-
-            calculated = (
-                (before - after) / before * 100
-            ).quantize(Decimal("0.01"))
-
-            reported = Decimal(
-                percentages[0].replace("%", "")
-            )
-
-            return {
-                "source_page": page_index + 1,
-                "reported_energy_saving_percent": reported,
-                "calculated_energy_saving_percent": calculated,
-                "rows": results,
-            }
-
-    raise ValueError(
-        "EnerCal comparison table not found."
-    )
+def extract_mod_document(pdf_bytes):
+    """Extract page text and comparison in a single PDF read."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as pdf:
+        if len(pdf) != 12:
+            raise ValueError("Expected a 12-page EnerCal MOD PDF.")
+        comparison = _parse_comparison(pdf[3])
+        pages = _page_texts(pdf)
+    return {"comparison": comparison, "pages": pages}

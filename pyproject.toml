@@ -6,10 +6,13 @@ description = "A simple Streamlit app template."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "numpy>=2.4.4",
+    "openpyxl>=3.1.5",
     "psycopg[binary]>=3.3.6",
     "pymupdf>=2.0",
     "python-dotenv>=1.2.4",
     "rapidfuzz>=3.14.3",
+    "scikit-learn>=1.9.1",
     "streamlit>=1.36.0",
 ]
 

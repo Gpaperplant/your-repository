@@ -165,3 +165,5 @@ cython_debug/
 
 # KONE FYP - Local test files
 sample_data//backups/
+
+sample_data/*.pdf
