@@ -90,6 +90,11 @@ def build_navigation(role):
                 icon=":material/rule:",
             ),
             st.Page(
+                "enercal/iso_assessment.py",
+                title="ISO energy assessment",
+                icon=":material/description:",
+            ),
+            st.Page(
                 "enercal/enercal_reporting.py",
                 title="Approved KPI reporting",
                 icon=":material/monitoring:",

@@ -1,4 +1,3 @@
-
 import streamlit as st
 
 from database import get_connection
@@ -28,6 +27,71 @@ def _completed_cases():
         WHERE m.status = 'completed'
         ORDER BY m.case_ref
         """
+    )
+
+
+def _all_cases():
+    """Show every registered project without changing its eligibility."""
+    return _read_rows(
+        """
+        SELECT
+            m.case_id,
+            m.case_ref,
+            m.status,
+            m.elevator_id,
+            e.elevator_ref,
+            COUNT(d.document_id) AS document_count
+        FROM modernisation_cases m
+        LEFT JOIN elevators e ON e.elevator_id = m.elevator_id
+        LEFT JOIN source_documents d ON d.case_id = m.case_id
+        GROUP BY
+            m.case_id, m.case_ref, m.status, m.elevator_id, e.elevator_ref
+        ORDER BY m.case_ref
+        """
+    )
+
+
+def _show_case_overview(all_cases, completed_cases):
+    """Read-only status overview; does not grant approval permissions."""
+    st.subheader("Modernisation cases")
+
+    first, second, third = st.columns(3)
+    first.metric("Total cases", len(all_cases))
+    completed_count = sum(row["status"] == "completed" for row in all_cases)
+    second.metric("Completed", completed_count)
+    third.metric("Not completed", len(all_cases) - completed_count)
+
+    if not all_cases:
+        st.info("No modernisation cases have been registered yet.")
+        return
+
+    completed_ids = {row["case_id"] for row in completed_cases}
+    st.dataframe(
+        [
+            {
+                "Case": row["case_ref"],
+                "Project status": row["status"],
+                "Elevator": row["elevator_ref"] or "Not linked",
+                "Uploaded EnerCal PDFs": row["document_count"],
+                "Measurement pair review": (
+                    "Eligible for evidence checks"
+                    if row["case_id"] in completed_ids
+                    else (
+                        "Link elevator before review"
+                        if row["status"] == "completed"
+                        else "Locked until completed"
+                    )
+                ),
+            }
+            for row in all_cases
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(
+        "All cases appear for tracking. Only completed cases with a linked "
+        "elevator can continue to measurement-pair submission and review. "
+        "Completing a project does not automatically verify meter evidence."
     )
 
 
@@ -309,19 +373,47 @@ def main():
         st.success(message)
 
     try:
-        cases = _completed_cases()
+        # Show every project, even if it is not yet eligible for meter review.
+        all_cases = _all_cases()
+        completed_cases = _completed_cases()
+        _show_case_overview(all_cases, completed_cases)
 
-        if not cases:
-            st.info("No completed modernisation cases are available.")
+        if not all_cases:
             return
 
-        case = st.selectbox(
-            "Completed case",
-            cases,
+        selected = st.selectbox(
+            "Modernisation case",
+            all_cases,
             format_func=lambda row: (
-                f"{row['case_ref']} | {row['elevator_ref']}"
+                f"{row['case_ref']} | "
+                f"{str(row['status']).replace('_', ' ').title()}"
             ),
+            key="measurement_pair_case_selector",
         )
+
+        # The original completed-case query remains the eligibility gate.
+        # Do not display approval forms for registered or ongoing projects.
+        completed_by_id = {
+            row["case_id"]: row for row in completed_cases
+        }
+        case = completed_by_id.get(selected["case_id"])
+
+        if case is None:
+            if selected["status"] == "completed":
+                st.warning(
+                    "This project is marked completed but has no valid linked "
+                    "elevator. Link and verify its elevator record before "
+                    "submitting measurement pairs."
+                )
+            else:
+                st.info(
+                    f"{selected['case_ref']} is currently "
+                    f"'{selected['status']}'. Measurement-pair submission "
+                    "and engineering approval stay locked until the actual "
+                    "modernisation is completed. An approved EnerCal PDF "
+                    "alone is not proof of project completion."
+                )
+            return
 
         pair = _existing_pair(case["case_id"])
 
