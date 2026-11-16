@@ -172,7 +172,7 @@ def show_specifications(specifications, document_id):
 
     st.caption(f"Showing {len(rows)} extracted fields")
 
-def _save_review(operation, message, error_label="Review")
+def _save_review(operation, message, error_label="Review"):
     try:
         result = operation()
     except Exception as error:
