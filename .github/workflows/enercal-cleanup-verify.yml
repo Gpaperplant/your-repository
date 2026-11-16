@@ -24,3 +24,16 @@ jobs:
           uv run python -m unittest discover -s tests -p 'test_mod_database.py' -v
           uv run python -m unittest discover -s tests -p 'test_enercal_reporting_page.py' -v
           uv run python -m unittest discover -s tests -p 'test_iso_import.py' -v
+
+      - name: Package cleaned files
+        uses: actions/upload-artifact@v4
+        with:
+          name: enercal-upload-review-cleanup-files
+          path: |
+            enercal/enercal_review.py
+            enercal/enercal_upload.py
+            services/enercal_review_repository.py
+            services/enercal_repository.py
+            tests/test_enercal_specs.py
+            tests/test_mod_database.py
+          if-no-files-found: error
