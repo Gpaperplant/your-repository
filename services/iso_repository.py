@@ -4,21 +4,20 @@ from decimal import Decimal, InvalidOperation
 from psycopg.types.json import Jsonb
 
 from database import get_connection
+from services.iso_pair_validator import normalise_lift_id
 
 
 def get_cases():
-    # Retrieve registered modernisation cases.
+    # Retrieve all registered modernisation cases.
     with get_connection() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT case_ref
-            FROM modernisation_cases
-            ORDER BY case_ref
-        """)
+        cur.execute(
+            "SELECT case_ref FROM modernisation_cases ORDER BY case_ref"
+        )
         return [row[0] for row in cur.fetchall()]
 
 
 def get_case_elevator(case_ref):
-    # Retrieve the elevator linked to the selected case.
+    # Retrieve the case and its registered elevator.
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT m.case_id, e.elevator_ref
@@ -37,7 +36,7 @@ def get_case_elevator(case_ref):
 
 
 def get_latest_iso_assessment(case_ref):
-    # Return the latest imported document pair for a case.
+    # Retrieve the latest assessment for a case.
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT a.assessment_id, a.lift_id, a.imported_at
@@ -51,7 +50,7 @@ def get_latest_iso_assessment(case_ref):
 
 
 def _number(value):
-    # Convert numeric values without losing precision.
+    # Convert valid numbers without losing precision.
     if value is None or isinstance(value, bool):
         return None
 
@@ -63,7 +62,7 @@ def _number(value):
 
 
 def _prepare_values(records):
-    # Prepare every extracted field without overwriting duplicates.
+    # Preserve each extracted field with its source information.
     prepared = []
     seen = set()
 
@@ -96,8 +95,14 @@ def _prepare_values(records):
     return prepared
 
 
-def save_iso_assessment(case_id, lift_id, files, records, comparisons):
-    # Check both document types and prepare records before saving.
+def save_iso_assessment(
+    case_id,
+    lift_id,
+    files,
+    records,
+    comparisons,
+):
+    # Require one PDF and one Excel document.
     if len(files) != 2 or len(records) != 2:
         raise ValueError("Both EE PDF and ISO Excel are required.")
 
@@ -108,7 +113,7 @@ def save_iso_assessment(case_id, lift_id, files, records, comparisons):
     pdf, excel = files
 
     with get_connection() as conn, conn.cursor() as cur:
-        # Lock the case to prevent simultaneous conflicting imports.
+        # Lock the case before checking existing assessments.
         cur.execute("""
             SELECT case_id
             FROM modernisation_cases
@@ -119,9 +124,9 @@ def save_iso_assessment(case_id, lift_id, files, records, comparisons):
         if cur.fetchone() is None:
             raise ValueError("Modernisation case not found.")
 
-        # Identify the latest assessment for version tracking.
+        # Check existing elevator identity inside the transaction.
         cur.execute("""
-            SELECT assessment_id
+            SELECT assessment_id, lift_id
             FROM iso_assessments
             WHERE case_id = %s
             ORDER BY imported_at DESC, assessment_id DESC
@@ -129,9 +134,18 @@ def save_iso_assessment(case_id, lift_id, files, records, comparisons):
         """, (case_id,))
 
         latest = cur.fetchone()
+
+        if latest and (
+            normalise_lift_id(latest[1])
+            != normalise_lift_id(lift_id)
+        ):
+            raise ValueError(
+                f"This case already contains ISO data for {latest[1]}."
+            )
+
         previous_id = latest[0] if latest else None
 
-        # Detect an identical document pair.
+        # Prevent duplicate document pairs.
         cur.execute("""
             SELECT assessment_id
             FROM iso_assessments
@@ -153,7 +167,7 @@ def save_iso_assessment(case_id, lift_id, files, records, comparisons):
                 "is_latest": existing[0] == previous_id,
             }
 
-        # Create a new assessment without deleting older versions.
+        # Create a new assessment version.
         cur.execute("""
             INSERT INTO iso_assessments (
                 case_id,
@@ -174,7 +188,7 @@ def save_iso_assessment(case_id, lift_id, files, records, comparisons):
 
         assessment_id = cur.fetchone()[0]
 
-        # Store both original files and all their extracted values.
+        # Save both original documents and their extracted values.
         for file, values in zip(files, prepared):
             cur.execute("""
                 INSERT INTO iso_documents (
@@ -220,7 +234,6 @@ def save_iso_assessment(case_id, lift_id, files, records, comparisons):
                 for value in values
             ])
 
-    # Report the new assessment and the version it replaces.
     return {
         "assessment_id": assessment_id,
         "created": True,
