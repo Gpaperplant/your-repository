@@ -1,5 +1,5 @@
 
-"""Save extracted data from the 12 page EnerCal MOD report"""
+"""Store an extracted EnerCal report and its initial review revision."""
 
 import hashlib
 
@@ -9,7 +9,7 @@ from services.enercal_specs import extract_specs
 
 
 def _comparison_candidates(comparison):
-    """Build the 16 fields used by engineering review"""
+    """Build the 16 fields used by engineering review."""
     currency = comparison["currency_symbol"]
     years = comparison["lifetime_years"]
     units = {
@@ -27,18 +27,20 @@ def _comparison_candidates(comparison):
         candidates.append(
             (f"{role}_elevator_technology", row["elevator_technology"], None, None)
         )
-        for field in COMPARISON_FIELDS:
-            value = row[field]
-            candidates.append((
+        candidates.extend(
+            (
                 f"{role}_{field}",
-                "N/A" if value is None else str(value),
-                value,
+                "N/A" if row[field] is None else str(row[field]),
+                row[field],
                 units[field],
-            ))
+            )
+            for field in COMPARISON_FIELDS
+        )
 
-    for field in ("reported_energy_saving_percent", "calculated_energy_saving_percent"):
-        value = comparison[field]
-        candidates.append((field, str(value), value, "%"))
+    candidates.extend(
+        (field, str(comparison[field]), comparison[field], "%")
+        for field in ("reported_energy_saving_percent", "calculated_energy_saving_percent")
+    )
 
     if len(candidates) != 16 or len({item[0] for item in candidates}) != 16:
         raise ValueError("The comparison must contain 16 unique fields")
@@ -46,11 +48,10 @@ def _comparison_candidates(comparison):
 
 
 def save_complete_enercal_report(case_ref, filename, pdf_bytes, extracted=None):
-    """Save the original PDF and one pending extraction revision"""
+    """Save the PDF and its first pending extraction revision."""
     if not pdf_bytes or not pdf_bytes.startswith(b"%PDF-"):
         raise ValueError("Choose a valid PDF")
 
-    # Reuse the preview results when the upload page supplies them
     data = extracted if extracted is not None else extract_mod_document(pdf_bytes)
     comparison = data["comparison"]
     pages = data["pages"]
@@ -70,7 +71,6 @@ def save_complete_enercal_report(case_ref, filename, pdf_bytes, extracted=None):
 
     checksum = hashlib.sha256(pdf_bytes).hexdigest()
 
-    # Save every record in one transaction to prevent partial uploads
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT case_id FROM modernisation_cases WHERE case_ref = %s",
@@ -142,7 +142,6 @@ def save_complete_enercal_report(case_ref, filename, pdf_bytes, extracted=None):
             ],
         )
 
-        # Record one event for the first extraction revision
         cur.execute(
             """
             INSERT INTO enercal_review_events
