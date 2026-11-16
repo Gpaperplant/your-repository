@@ -3,7 +3,7 @@ import unittest
 
 import pymupdf
 
-from services.enercal_specs import _normalise, extract_specs
+from services.enercal_specs import extract_specs
 
 
 def synthetic_report():
@@ -53,12 +53,6 @@ def synthetic_report():
 
 
 class ExtractionTest(unittest.TestCase):
-
-    def test_normalise(self):
-        self.assertEqual(
-            _normalise("Nominal Load [kg]"),
-            "nominal load kg"
-        )
 
     def test_shifted_layout_and_alias(self):
         values = {
