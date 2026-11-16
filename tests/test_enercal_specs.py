@@ -85,5 +85,38 @@ class ExtractionTest(unittest.TestCase):
             self.assertEqual(extract_specs(pdf.tobytes()), [])
 
 
+class UploadCandidatesTest(unittest.TestCase):
+    def test_comparison_preserves_sixteen_fields_and_missing_values(self):
+        from decimal import Decimal
+        from services.enercal_extractor import COMPARISON_FIELDS
+        from services.enercal_repository import _comparison_candidates
+
+        before = {field: Decimal("10") for field in COMPARISON_FIELDS}
+        after = {field: Decimal("5") for field in COMPARISON_FIELDS}
+        after["annual_regenerative_energy"] = None
+        comparison = {
+            "currency_symbol": "$",
+            "lifetime_years": 25,
+            "rows": {
+                "existing": {"elevator_technology": "Old", **before},
+                "proposed": {"elevator_technology": "New", **after},
+            },
+            "reported_energy_saving_percent": Decimal("50"),
+            "calculated_energy_saving_percent": Decimal("50.00"),
+        }
+
+        rows = _comparison_candidates(comparison)
+        self.assertEqual(len(rows), 16)
+        self.assertEqual(len({row[0] for row in rows}), 16)
+        self.assertEqual(rows[0][:2], ("existing_elevator_technology", "Old"))
+        self.assertEqual(rows[7][:2], ("proposed_elevator_technology", "New"))
+        self.assertEqual(rows[8][0], "proposed_annual_energy_consumption")
+        self.assertEqual(rows[-1][0], "calculated_energy_saving_percent")
+        missing = next(
+            row for row in rows if row[0] == "proposed_annual_regenerative_energy"
+        )
+        self.assertEqual(missing[1:3], ("N/A", None))
+
+
 if __name__ == "__main__":
     unittest.main()
