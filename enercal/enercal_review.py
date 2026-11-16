@@ -172,13 +172,11 @@ def show_specifications(specifications, document_id):
 
     st.caption(f"Showing {len(rows)} extracted fields")
 
-
-
-def _save_review(operation, message):
+def _save_review(operation, message, error_label="Review")
     try:
         result = operation()
     except Exception as error:
-        st.error(f"Review could not be saved: {error}")
+        st.error(f"{error_label} could not be saved: {error}")
     else:
         notify(message(result) if callable(message) else message)
 
@@ -271,6 +269,7 @@ def _correct_review(document_id, revision_no, candidates):
     _save_review(
         lambda: resubmit_revision(document_id, corrected, note.strip()),
         lambda new_number: f"Revision {new_number} created for review",
+        error_label="Corrections",
     )
 
 
@@ -296,6 +295,7 @@ def _other_decision(document_id, revision_no):
     _save_review(
         lambda: review_revision(document_id, decision, reason.strip()),
         f"Revision {revision_no} updated",
+        error_label="Decision",
     )
 
 
@@ -437,13 +437,13 @@ with st.container(border=True):
     with saving_col:
         st.metric(
             "Energy saving",
-            f"{format_value(calculated)}%",
+            f"{format_value(calculated)}%" if calculated is not None else "N/A",
         )
 
     with reduction_col:
         st.metric(
             "Annual energy reduction",
-            f"{format_value(reduction)} kWh",
+            f"{format_value(reduction)} kWh" if reduction is not None else "N/A",
         )
 
 
@@ -505,6 +505,7 @@ with overview_tab:
 
     st.write(
         f"EnerCal reported saving **{format_value(reported)}%**"
+        if reported is not None else "EnerCal reported saving **N/A**"
     )
 
     if status == "approved":
