@@ -279,5 +279,41 @@ class TestModDatabase(unittest.TestCase):
             self.assertEqual(cur.fetchone()[0], 1)
 
 
+class TestReviewHelpers(unittest.TestCase):
+    def test_locked_revision_validates_current_candidates(self):
+        from services import enercal_review_repository as review
+
+        revision = {"revision_id": 8, "revision_no": 2}
+        candidates = [{"field_name": "example"}]
+        cursor = object()
+        with (
+            patch.object(review, "_lock") as lock,
+            patch.object(review, "_latest", return_value=revision) as latest,
+            patch.object(review, "_candidates", return_value=candidates) as read,
+            patch.object(review, "_validate") as validate,
+        ):
+            self.assertEqual(review._validated_revision(cursor, 53), revision)
+
+        lock.assert_called_once_with(cursor, 53)
+        latest.assert_called_once_with(cursor, 53, for_update=True)
+        read.assert_called_once_with(cursor, 8)
+        validate.assert_called_once_with(candidates, 2)
+
+    def test_missing_or_duplicate_comparison_fields_are_rejected(self):
+        from services import enercal_review_repository as review
+
+        candidates = [
+            {"field_name": name, "page_id": 4, "revision_no": 1}
+            for name in review.FIELD_LABELS
+        ]
+        review._validate(candidates, 1)
+        with self.assertRaisesRegex(ValueError, "16 unique"):
+            review._validate(candidates[:-1], 1)
+        with self.assertRaisesRegex(ValueError, "one source PDF page"):
+            review._validate([*candidates[:-1], {**candidates[-1], "page_id": 5}], 1)
+        with self.assertRaisesRegex(ValueError, "revision numbers do not match"):
+            review._validate([*candidates[:-1], {**candidates[-1], "revision_no": 2}], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
