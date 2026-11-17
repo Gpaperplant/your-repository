@@ -137,8 +137,11 @@ def show_specifications(specifications, document_id):
         name = item["Field"]
         value = item["Value"]
 
-        if name == "Report date":
-            value = date.fromisoformat(value).strftime("%d %B %Y").lstrip("0")
+        if name == "Report date" and value:
+            try:
+                value = date.fromisoformat(str(value)).strftime("%d %B %Y").lstrip("0")
+            except ValueError:
+                pass
 
         row = {
             "Field": SPEC_LABELS.get(name, name),
@@ -169,9 +172,134 @@ def show_specifications(specifications, document_id):
 
     st.caption(f"Showing {len(rows)} extracted fields")
 
+def _save_review(operation, message, error_label="Review"):
+    try:
+        result = operation()
+    except Exception as error:
+        st.error(f"{error_label} could not be saved: {error}")
+    else:
+        notify(message(result) if callable(message) else message)
+
+
+def _confirm_review(document_id, revision_no, action):
+    with st.form(f"enercal_confirm_{document_id}_{revision_no}"):
+        note = st.text_input(
+            "Review note optional"
+            if action == "Approve" else "Reason for confirmation"
+        )
+        checked = st.checkbox(
+            "I checked the comparison values against the source PDF"
+        )
+        submitted = st.form_submit_button(
+            "Approve report" if action == "Approve" else "Confirm values",
+            type="primary",
+        )
+
+    if not submitted:
+        return
+    if not checked:
+        st.error("Confirm that you checked the source PDF")
+        return
+    if action == "Confirm unchanged" and not note.strip():
+        st.error("Explain why the values need no correction")
+        return
+
+    if action == "Approve":
+        _save_review(
+            lambda: review_revision(document_id, "approved", note.strip()),
+            f"Revision {revision_no} approved",
+        )
+    else:
+        _save_review(
+            lambda: submit_verification(document_id, note.strip()),
+            f"Revision {revision_no} returned to pending review",
+        )
+
+
+def _correct_review(document_id, revision_no, candidates):
+    editable = pd.DataFrame([
+        {
+            "Field key": key,
+            "Field": label,
+            "Source value": candidates[key]["raw_value"],
+            "Corrected value": candidates[key]["raw_value"],
+        }
+        for key, label in FIELD_LABELS.items()
+        if key != CALCULATED_FIELD
+    ])
+
+    with st.form(f"enercal_edit_{document_id}_{revision_no}"):
+        updated = st.data_editor(
+            editable,
+            hide_index=True,
+            num_rows="fixed",
+            width="stretch",
+            height=480,
+            disabled=["Field key", "Field", "Source value"],
+            column_config={
+                "Field key": None,
+                "Field": st.column_config.TextColumn("Field", width="large"),
+                "Source value": st.column_config.TextColumn("Source value"),
+                "Corrected value": st.column_config.TextColumn("Corrected value"),
+            },
+            key=f"enercal_editor_{document_id}_{revision_no}",
+        )
+        note = st.text_area("Reason for corrections", height=90)
+        checked = st.checkbox(
+            "I checked the corrected values against the source PDF"
+        )
+        submitted = st.form_submit_button(
+            "Save corrected values", type="primary"
+        )
+
+    if not submitted:
+        return
+    if not note.strip():
+        st.error("Explain which values were corrected")
+        return
+    if not checked:
+        st.error("Confirm that you checked the corrections")
+        return
+
+    corrected = {
+        row["Field key"]: str(row["Corrected value"]).strip()
+        for row in updated.to_dict("records")
+    }
+    corrected[CALCULATED_FIELD] = candidates[CALCULATED_FIELD]["raw_value"]
+    _save_review(
+        lambda: resubmit_revision(document_id, corrected, note.strip()),
+        lambda new_number: f"Revision {new_number} created for review",
+        error_label="Corrections",
+    )
+
+
+def _other_decision(document_id, revision_no):
+    decisions = {
+        "changes_requested": "Request changes",
+        "further_verification_required": "Require further verification",
+        "rejected": "Reject report",
+    }
+    with st.form(f"enercal_decision_{document_id}_{revision_no}"):
+        decision = st.selectbox(
+            "Decision", list(decisions), format_func=decisions.get
+        )
+        reason = st.text_area("Reason for decision", height=90)
+        submitted = st.form_submit_button("Save decision")
+
+    if not submitted:
+        return
+    if not reason.strip():
+        st.error("Explain this decision")
+        return
+
+    _save_review(
+        lambda: review_revision(document_id, decision, reason.strip()),
+        f"Revision {revision_no} updated",
+        error_label="Decision",
+    )
+
 
 def review_forms(document_id, revision_no, status, candidates):
-    # Engineers edit source fields while the calculated saving stays read only.
     if status not in EDITABLE_STATUSES:
         st.info("This revision is read only and its decisions remain in History")
         return
@@ -181,194 +309,18 @@ def review_forms(document_id, revision_no, status, candidates):
         if status == "pending"
         else ["Confirm unchanged", "Correct values"]
     )
-
     action = st.radio(
         "Choose a review action",
         choices,
         horizontal=True,
         key=f"enercal_action_{document_id}_{revision_no}",
     )
-
     if action in {"Approve", "Confirm unchanged"}:
-        with st.form(f"enercal_confirm_{document_id}_{revision_no}"):
-            note = st.text_input(
-                "Review note optional"
-                if action == "Approve"
-                else "Reason for confirmation"
-            )
-
-            checked = st.checkbox(
-                "I checked the comparison values against the source PDF"
-            )
-
-            submitted = st.form_submit_button(
-                "Approve report"
-                if action == "Approve"
-                else "Confirm values",
-                type="primary",
-            )
-
-        if submitted:
-            if not checked:
-                st.error("Confirm that you checked the source PDF")
-
-            elif action == "Confirm unchanged" and not note.strip():
-                st.error("Explain why the values need no correction")
-
-            else:
-                try:
-                    if action == "Approve":
-                        review_revision(
-                            document_id,
-                            "approved",
-                            note.strip(),
-                        )
-                        message = f"Revision {revision_no} approved"
-
-                    else:
-                        submit_verification(
-                            document_id,
-                            note.strip(),
-                        )
-                        message = (
-                            f"Revision {revision_no} returned to pending review"
-                        )
-
-                except Exception as error:
-                    st.error(f"Review could not be saved {error}")
-
-                else:
-                    notify(message)
-
-        return
-
-    if action == "Correct values":
-        editable = pd.DataFrame([
-            {
-                "Field key": key,
-                "Field": label,
-                "Source value": candidates[key]["raw_value"],
-                "Corrected value": candidates[key]["raw_value"],
-            }
-            for key, label in FIELD_LABELS.items()
-            if key != CALCULATED_FIELD
-        ])
-
-        st.caption(
-            "Update only the incorrect values and explain each correction"
-        )
-
-        with st.form(f"enercal_edit_{document_id}_{revision_no}"):
-            updated = st.data_editor(
-                editable,
-                hide_index=True,
-                num_rows="fixed",
-                width="stretch",
-                height=480,
-                disabled=[
-                    "Field key",
-                    "Field",
-                    "Source value",
-                ],
-                column_config={
-                    "Field key": None,
-                    "Field": st.column_config.TextColumn(
-                        "Field",
-                        width="large",
-                    ),
-                    "Source value": st.column_config.TextColumn(
-                        "Source value"
-                    ),
-                    "Corrected value": st.column_config.TextColumn(
-                        "Corrected value"
-                    ),
-                },
-                key=f"enercal_editor_{document_id}_{revision_no}",
-            )
-
-            note = st.text_area(
-                "Reason for corrections",
-                height=90,
-            )
-
-            checked = st.checkbox(
-                "I checked the corrected values against the source PDF"
-            )
-
-            submitted = st.form_submit_button(
-                "Save corrected values",
-                type="primary",
-            )
-
-        if submitted:
-            corrected = {
-                row["Field key"]: str(row["Corrected value"]).strip()
-                for row in updated.to_dict("records")
-            }
-
-            corrected[CALCULATED_FIELD] = (
-                candidates[CALCULATED_FIELD]["raw_value"]
-            )
-
-            if not note.strip():
-                st.error("Explain which values were corrected")
-
-            elif not checked:
-                st.error("Confirm that you checked the corrections")
-
-            else:
-                try:
-                    new_revision = resubmit_revision(
-                        document_id,
-                        corrected,
-                        note.strip(),
-                    )
-
-                except Exception as error:
-                    st.error(f"Corrections could not be saved {error}")
-
-                else:
-                    notify(f"Revision {new_revision} created for review")
-
-        return
-
-    with st.form(f"enercal_decision_{document_id}_{revision_no}"):
-        decisions = {
-            "changes_requested": "Request changes",
-            "further_verification_required": "Require further verification",
-            "rejected": "Reject report",
-        }
-
-        decision = st.selectbox(
-            "Decision",
-            list(decisions),
-            format_func=decisions.get,
-        )
-
-        reason = st.text_area(
-            "Reason for decision",
-            height=90,
-        )
-
-        submitted = st.form_submit_button("Save decision")
-
-    if submitted:
-        if not reason.strip():
-            st.error("Explain this decision")
-
-        else:
-            try:
-                review_revision(
-                    document_id,
-                    decision,
-                    reason.strip(),
-                )
-
-            except Exception as error:
-                st.error(f"Decision could not be saved {error}")
-
-            else:
-                notify(f"Revision {revision_no} updated")
+        _confirm_review(document_id, revision_no, action)
+    elif action == "Correct values":
+        _correct_review(document_id, revision_no, candidates)
+    else:
+        _other_decision(document_id, revision_no)
 
 
 # Only administrators can access review decisions and PDF source files.
@@ -485,13 +437,13 @@ with st.container(border=True):
     with saving_col:
         st.metric(
             "Energy saving",
-            f"{format_value(calculated)}%",
+            f"{format_value(calculated)}%" if calculated is not None else "N/A",
         )
 
     with reduction_col:
         st.metric(
             "Annual energy reduction",
-            f"{format_value(reduction)} kWh",
+            f"{format_value(reduction)} kWh" if reduction is not None else "N/A",
         )
 
 
@@ -553,6 +505,7 @@ with overview_tab:
 
     st.write(
         f"EnerCal reported saving **{format_value(reported)}%**"
+        if reported is not None else "EnerCal reported saving **N/A**"
     )
 
     if status == "approved":
@@ -645,44 +598,12 @@ with data_tab:
         hide_index=True,
         width="stretch",
         column_config={
-            "Measure": st.column_config.TextColumn(
-                "Measure",
-                width="large",
-            ),
-            "Existing": st.column_config.TextColumn(
-                "Existing",
-                width="medium",
-            ),
-            "Proposed": st.column_config.TextColumn(
-                "Proposed",
-                width="medium",
-            ),
-            "Unit": st.column_config.TextColumn(
-                "Unit",
-                width="medium",
-            ),
+            "Measure": st.column_config.TextColumn("Measure", width="large"),
+            **{
+                name: st.column_config.TextColumn(name, width="medium")
+                for name in ("Existing", "Proposed", "Unit")
+            },
         },
-    )
-
-    st.subheader("Energy saving results")
-
-    st.dataframe(
-        [
-            {
-                "Measure": "Reported saving",
-                "Value": f"{format_value(reported)}%",
-            },
-            {
-                "Measure": "Calculated saving",
-                "Value": f"{format_value(calculated)}%",
-            },
-        ],
-        hide_index=True,
-        width="stretch",
-    )
-
-    st.caption(
-        "The comparison includes all 16 extracted values"
     )
 
     with st.expander("Profile and engineering information"):
