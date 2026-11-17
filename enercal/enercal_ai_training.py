@@ -80,9 +80,9 @@ def _show_readiness(dataset, excluded):
             "distinct elevators have eligible verified measurements."
         )
         st.info(
-            "Approve genuine metered before-and-after period totals in "
-            "Measurement Pair Review. EnerCal estimates and ISO reference-cycle "
-            "calculations alone are not valid measured training targets."
+            "Training requires independently verified before-and-after metered "
+            "energy totals from completed modernisation projects. ISO and "
+            "EnerCal estimates are not measured training targets."
         )
         return False
 

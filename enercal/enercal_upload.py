@@ -17,7 +17,6 @@ from services.enercal_specs import extract_specs
 MAX_PDF_SIZE = 15 * 1024 * 1024
 
 
-# Every modernisation case must be linked to an elevator.
 def load_options():
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -85,37 +84,21 @@ def format_value(value):
 def comparison_rows(comparison):
     currency = comparison["currency_symbol"]
     years = comparison["lifetime_years"]
-
     fields = (
         ("Elevator technology", "elevator_technology", ""),
         ("Annual energy", "annual_energy_consumption", "kWh/year"),
         ("Regenerative energy", "annual_regenerative_energy", "kWh/year"),
-        (
-            "Annual electricity cost",
-            "annual_electricity_expenditure",
-            f"{currency}/year",
-        ),
-        (
-            "Lifetime electricity cost",
-            "lifetime_electricity_expenditure",
-            currency,
-        ),
-        (
-            "Operational CO₂e",
-            "operational_co2e",
-            f"kg CO₂e over {years} years",
-        ),
+        ("Annual electricity cost", "annual_electricity_expenditure", f"{currency}/year"),
+        ("Lifetime electricity cost", "lifetime_electricity_expenditure", currency),
+        ("Operational CO₂e", "operational_co2e", f"kg CO₂e over {years} years"),
         ("Embodied CO₂e", "embodied_co2e", "kg CO₂e"),
     )
-
-    existing = comparison["rows"]["existing"]
-    proposed = comparison["rows"]["proposed"]
-
+    rows = comparison["rows"]
     return [
         {
             "Measure": label,
-            "Existing": format_value(existing[key]),
-            "Proposed": format_value(proposed[key]),
+            "Existing": format_value(rows["existing"][key]),
+            "Proposed": format_value(rows["proposed"][key]),
             "Unit": unit,
         }
         for label, key, unit in fields
@@ -124,7 +107,6 @@ def comparison_rows(comparison):
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def extract_report(pdf_bytes):
-    # Cache extracted results to avoid repeated PDF processing.
     result = extract_mod_document(pdf_bytes)
     result["specifications"] = extract_specs(pdf_bytes)
     return result
@@ -237,7 +219,6 @@ if not pdf_bytes.startswith(b"%PDF-") or len(pdf_bytes) > MAX_PDF_SIZE:
     st.stop()
 
 
-# Check for duplicates before extracting the PDF.
 try:
     existing_id = find_existing_document(case_ref, pdf_bytes)
 except Exception as error:
@@ -252,7 +233,6 @@ if existing_id is not None:
     st.stop()
 
 
-# Read the PDF and reuse the results during saving.
 try:
     with st.spinner("Reading MOD report"):
         extracted = extract_report(pdf_bytes)

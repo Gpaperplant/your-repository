@@ -1,11 +1,8 @@
-
 """Entry point for the KONE modernisation workspace."""
 
 import streamlit as st
 
-
 ROLES = ("Requester", "Responder", "Admin")
-
 
 st.set_page_config(
     page_title="KONE Modernisation",
@@ -13,23 +10,16 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
 st.logo("images/horizontal_blue.png", icon_image="images/icon_blue.png")
 st.session_state.setdefault("role", None)
 
 
 def login():
-    # Role selection is for the prototype and is not authentication.
     st.subheader("Welcome to KONE Modernisation")
     st.caption("Choose your workspace role to continue")
-
     role = st.selectbox(
-        "Workspace role",
-        ROLES,
-        index=None,
-        placeholder="Choose a role",
+        "Workspace role", ROLES, index=None, placeholder="Choose a role"
     )
-
     if st.button("Continue", type="primary", disabled=role is None):
         st.session_state.role = role
         st.rerun()
@@ -45,7 +35,6 @@ def build_navigation(role):
         return [st.Page(login, title="Choose role", icon=":material/person:")]
 
     pages = {}
-
     if role in ("Requester", "Admin"):
         pages["Requests"] = [
             st.Page(
@@ -53,9 +42,8 @@ def build_navigation(role):
                 title="Submit and view requests",
                 icon=":material/assignment:",
                 default=role == "Requester",
-            ),
+            )
         ]
-
     if role in ("Responder", "Admin"):
         pages["Responses"] = [
             st.Page(
@@ -63,40 +51,29 @@ def build_navigation(role):
                 title="Manage responses",
                 icon=":material/forum:",
                 default=role == "Responder",
-            ),
+            )
         ]
-
     if role == "Admin":
         pages["EnerCal"] = [
             st.Page(
                 "enercal/enercal_upload.py",
-                title="Upload report",
+                title="Upload Enercal report",
                 icon=":material/upload_file:",
                 default=True,
             ),
             st.Page(
-                "enercal/enercal_review.py",
-                title="Case workspace",
-                icon=":material/fact_check:",
-            ),
-            st.Page(
                 "enercal/enercal_measurements.py",
-                title="Energy measurements",
+                title="Upload EE report and ISO excel",
                 icon=":material/monitor_heart:",
             ),
             st.Page(
-                "enercal/enercal_measurement_pairs.py",
-                title="Measurement pair review",
-                icon=":material/rule:",
-            ),
-            st.Page(
-                "enercal/iso_assessment.py",
-                title="ISO energy assessment",
-                icon=":material/description:",
+                "enercal/enercal_review.py",
+                title="Cases infomation",
+                icon=":material/fact_check:",
             ),
             st.Page(
                 "enercal/enercal_reporting.py",
-                title="Approved KPI reporting",
+                title="Approved Cases overview",
                 icon=":material/monitoring:",
             ),
             st.Page(
@@ -114,13 +91,10 @@ def build_navigation(role):
     pages["Account"] = [
         st.Page(logout, title="Log out", icon=":material/logout:")
     ]
-
     return pages
 
 
 role = st.session_state.role
-
 if role in ROLES:
     st.sidebar.caption(f"Current role  {role}")
-
 st.navigation(build_navigation(role)).run()

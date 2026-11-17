@@ -1,6 +1,6 @@
-
 import math
 import re
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 
@@ -61,6 +61,15 @@ def _number(value):
         return None
 
 
+def _date_only(value):
+    # Compare calendar dates without treating midnight as a different day.
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return datetime.fromisoformat(str(value).strip()).date()
+
+
 def _same(first, second, field):
     # Compare elevator IDs independently from other values.
     if field == "lift_id":
@@ -69,6 +78,13 @@ def _same(first, second, field):
     # Compare serial numbers exactly.
     if field == "serial_number":
         return str(first).strip() == str(second).strip()
+
+    # Compare test dates rather than their string representations.
+    if field == "test_date":
+        try:
+            return _date_only(first) == _date_only(second)
+        except (TypeError, ValueError):
+            return False
 
     # Standardise energy efficiency class labels.
     if field == "efficiency_class":

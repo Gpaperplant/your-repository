@@ -100,14 +100,13 @@ def _candidates(cur, revision_id):
         """,
         (revision_id,),
     )
-
     return _rows(cur)
 
 
 def _validate(candidates, revision_no):
     names = [row["field_name"] for row in candidates]
 
-    if len(names) != 16 or set(names) != EXPECTED_FIELDS:
+    if len(names) != len(EXPECTED_FIELDS) or set(names) != EXPECTED_FIELDS:
         raise ValueError(
             "The revision must contain exactly 16 unique comparison fields"
         )
@@ -121,6 +120,13 @@ def _validate(candidates, revision_no):
         raise ValueError(
             "Candidate and revision numbers do not match"
         )
+
+
+def _validated_revision(cur, document_id):
+    _lock(cur, document_id)
+    revision = _latest(cur, document_id, for_update=True)
+    _validate(_candidates(cur, revision["revision_id"]), revision["revision_no"])
+    return revision
 
 
 def _event(cur, revision_id, action, old_status, new_status, reason):
@@ -279,14 +285,7 @@ def review_revision(document_id, decision, review_note=""):
         raise ValueError("A reason is required for this decision")
 
     with get_connection() as conn, conn.cursor() as cur:
-        _lock(cur, document_id)
-
-        revision = _latest(cur, document_id, for_update=True)
-
-        _validate(
-            _candidates(cur, revision["revision_id"]),
-            revision["revision_no"],
-        )
+        revision = _validated_revision(cur, document_id)
 
         if revision["review_status"] != "pending":
             raise ValueError(
@@ -333,14 +332,7 @@ def submit_verification(document_id, explanation):
         raise ValueError("A clarification reason is required")
 
     with get_connection() as conn, conn.cursor() as cur:
-        _lock(cur, document_id)
-
-        revision = _latest(cur, document_id, for_update=True)
-
-        _validate(
-            _candidates(cur, revision["revision_id"]),
-            revision["revision_no"],
-        )
+        revision = _validated_revision(cur, document_id)
 
         old_status = revision["review_status"]
 
@@ -441,20 +433,8 @@ def resubmit_revision(document_id, corrected_values, resubmission_note):
         )
 
     with get_connection() as conn, conn.cursor() as cur:
-        _lock(cur, document_id)
-
-        previous = _latest(
-            cur,
-            document_id,
-            for_update=True,
-        )
-
-        source = _candidates(
-            cur,
-            previous["revision_id"],
-        )
-
-        _validate(source, previous["revision_no"])
+        previous = _validated_revision(cur, document_id)
+        source = _candidates(cur, previous["revision_id"])
 
         old_status = previous["review_status"]
 
@@ -468,7 +448,6 @@ def resubmit_revision(document_id, corrected_values, resubmission_note):
             for row in source
         }
 
-        # Parse the editable source values once.
         values = {
             key: _parse_value(key, corrected_values[key])
             for key in FIELD_LABELS
@@ -488,7 +467,6 @@ def resubmit_revision(document_id, corrected_values, resubmission_note):
                 "Existing annual energy must be greater than zero"
             )
 
-        # Recalculate the saving from corrected energy values.
         saving = (
             (before - after) / before * 100
         ).quantize(
@@ -501,7 +479,6 @@ def resubmit_revision(document_id, corrected_values, resubmission_note):
             saving,
         )
 
-        # Compare numeric values rather than number formatting.
         changed = [
             key
             for key in FIELD_LABELS
@@ -532,7 +509,6 @@ def resubmit_revision(document_id, corrected_values, resubmission_note):
 
         new_id = cur.fetchone()[0]
 
-        # Store the full corrected comparison as a new revision.
         cur.executemany(
             """
             INSERT INTO extraction_candidates
@@ -556,7 +532,6 @@ def resubmit_revision(document_id, corrected_values, resubmission_note):
             ],
         )
 
-        # Preserve the correction history for both revisions.
         _event(
             cur,
             previous["revision_id"],

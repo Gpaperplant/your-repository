@@ -137,8 +137,11 @@ def show_specifications(specifications, document_id):
         name = item["Field"]
         value = item["Value"]
 
-        if name == "Report date":
-            value = date.fromisoformat(value).strftime("%d %B %Y").lstrip("0")
+        if name == "Report date" and value:
+            try:
+                value = date.fromisoformat(str(value)).strftime("%d %B %Y").lstrip("0")
+            except ValueError:
+                pass
 
         row = {
             "Field": SPEC_LABELS.get(name, name),
@@ -169,9 +172,134 @@ def show_specifications(specifications, document_id):
 
     st.caption(f"Showing {len(rows)} extracted fields")
 
+def _save_review(operation, message, error_label="Review"):
+    try:
+        result = operation()
+    except Exception as error:
+        st.error(f"{error_label} could not be saved: {error}")
+    else:
+        notify(message(result) if callable(message) else message)
+
+
+def _confirm_review(document_id, revision_no, action):
+    with st.form(f"enercal_confirm_{document_id}_{revision_no}"):
+        note = st.text_input(
+            "Review note optional"
+            if action == "Approve" else "Reason for confirmation"
+        )
+        checked = st.checkbox(
+            "I checked the comparison values against the source PDF"
+        )
+        submitted = st.form_submit_button(
+            "Approve report" if action == "Approve" else "Confirm values",
+            type="primary",
+        )
+
+    if not submitted:
+        return
+    if not checked:
+        st.error("Confirm that you checked the source PDF")
+        return
+    if action == "Confirm unchanged" and not note.strip():
+        st.error("Explain why the values need no correction")
+        return
+
+    if action == "Approve":
+        _save_review(
+            lambda: review_revision(document_id, "approved", note.strip()),
+            f"Revision {revision_no} approved",
+        )
+    else:
+        _save_review(
+            lambda: submit_verification(document_id, note.strip()),
+            f"Revision {revision_no} returned to pending review",
+        )
+
+
+def _correct_review(document_id, revision_no, candidates):
+    editable = pd.DataFrame([
+        {
+            "Field key": key,
+            "Field": label,
+            "Source value": candidates[key]["raw_value"],
+            "Corrected value": candidates[key]["raw_value"],
+        }
+        for key, label in FIELD_LABELS.items()
+        if key != CALCULATED_FIELD
+    ])
+
+    with st.form(f"enercal_edit_{document_id}_{revision_no}"):
+        updated = st.data_editor(
+            editable,
+            hide_index=True,
+            num_rows="fixed",
+            width="stretch",
+            height=480,
+            disabled=["Field key", "Field", "Source value"],
+            column_config={
+                "Field key": None,
+                "Field": st.column_config.TextColumn("Field", width="large"),
+                "Source value": st.column_config.TextColumn("Source value"),
+                "Corrected value": st.column_config.TextColumn("Corrected value"),
+            },
+            key=f"enercal_editor_{document_id}_{revision_no}",
+        )
+        note = st.text_area("Reason for corrections", height=90)
+        checked = st.checkbox(
+            "I checked the corrected values against the source PDF"
+        )
+        submitted = st.form_submit_button(
+            "Save corrected values", type="primary"
+        )
+
+    if not submitted:
+        return
+    if not note.strip():
+        st.error("Explain which values were corrected")
+        return
+    if not checked:
+        st.error("Confirm that you checked the corrections")
+        return
+
+    corrected = {
+        row["Field key"]: str(row["Corrected value"]).strip()
+        for row in updated.to_dict("records")
+    }
+    corrected[CALCULATED_FIELD] = candidates[CALCULATED_FIELD]["raw_value"]
+    _save_review(
+        lambda: resubmit_revision(document_id, corrected, note.strip()),
+        lambda new_number: f"Revision {new_number} created for review",
+        error_label="Corrections",
+    )
+
+
+def _other_decision(document_id, revision_no):
+    decisions = {
+        "changes_requested": "Request changes",
+        "further_verification_required": "Require further verification",
+        "rejected": "Reject report",
+    }
+    with st.form(f"enercal_decision_{document_id}_{revision_no}"):
+        decision = st.selectbox(
+            "Decision", list(decisions), format_func=decisions.get
+        )
+        reason = st.text_area("Reason for decision", height=90)
+        submitted = st.form_submit_button("Save decision")
+
+    if not submitted:
+        return
+    if not reason.strip():
+        st.error("Explain this decision")
+        return
+
+    _save_review(
+        lambda: review_revision(document_id, decision, reason.strip()),
+        f"Revision {revision_no} updated",
+        error_label="Decision",
+    )
+
 
 def review_forms(document_id, revision_no, status, candidates):
-    # Engineers edit source fields while the calculated saving stays read only.
     if status not in EDITABLE_STATUSES:
         st.info("This revision is read only and its decisions remain in History")
         return
@@ -181,194 +309,158 @@ def review_forms(document_id, revision_no, status, candidates):
         if status == "pending"
         else ["Confirm unchanged", "Correct values"]
     )
-
     action = st.radio(
         "Choose a review action",
         choices,
         horizontal=True,
         key=f"enercal_action_{document_id}_{revision_no}",
     )
-
     if action in {"Approve", "Confirm unchanged"}:
-        with st.form(f"enercal_confirm_{document_id}_{revision_no}"):
-            note = st.text_input(
-                "Review note optional"
-                if action == "Approve"
-                else "Reason for confirmation"
-            )
+        _confirm_review(document_id, revision_no, action)
+    elif action == "Correct values":
+        _correct_review(document_id, revision_no, candidates)
+    else:
+        _other_decision(document_id, revision_no)
 
-            checked = st.checkbox(
-                "I checked the comparison values against the source PDF"
-            )
 
-            submitted = st.form_submit_button(
-                "Approve report"
-                if action == "Approve"
-                else "Confirm values",
-                type="primary",
-            )
+def _iso_rows(cur):
+    columns = [item.name for item in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
 
-        if submitted:
-            if not checked:
-                st.error("Confirm that you checked the source PDF")
 
-            elif action == "Confirm unchanged" and not note.strip():
-                st.error("Explain why the values need no correction")
+def _saved_iso_assessments(case_ref):
+    # Match assessments to the case selected in the EnerCal workspace.
+    from database import get_connection
 
-            else:
-                try:
-                    if action == "Approve":
-                        review_revision(
-                            document_id,
-                            "approved",
-                            note.strip(),
-                        )
-                        message = f"Revision {revision_no} approved"
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT a.assessment_id, a.lift_id, a.imported_at
+            FROM iso_assessments a
+            JOIN modernisation_cases m ON m.case_id = a.case_id
+            WHERE m.case_ref = %s
+            ORDER BY a.imported_at DESC, a.assessment_id DESC
+            """,
+            (case_ref,),
+        )
+        return _iso_rows(cur)
 
-                    else:
-                        submit_verification(
-                            document_id,
-                            note.strip(),
-                        )
-                        message = (
-                            f"Revision {revision_no} returned to pending review"
-                        )
 
-                except Exception as error:
-                    st.error(f"Review could not be saved {error}")
+def _saved_iso_details(case_ref, assessment_id):
+    # Validate the case association in both read-only queries.
+    from database import get_connection
 
-                else:
-                    notify(message)
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT d.document_id, d.document_type, d.filename, d.content
+            FROM iso_documents d
+            JOIN iso_assessments a ON a.assessment_id = d.assessment_id
+            JOIN modernisation_cases m ON m.case_id = a.case_id
+            WHERE a.assessment_id = %s AND m.case_ref = %s
+            ORDER BY d.document_type
+            """,
+            (assessment_id, case_ref),
+        )
+        documents = _iso_rows(cur)
 
+        cur.execute(
+            """
+            SELECT d.document_type, v.field_name, v.value_text, v.unit,
+                   v.data_kind, v.pdf_page, v.excel_sheet, v.excel_cell
+            FROM iso_extracted_values v
+            JOIN iso_documents d ON d.document_id = v.document_id
+            JOIN iso_assessments a ON a.assessment_id = d.assessment_id
+            JOIN modernisation_cases m ON m.case_id = a.case_id
+            WHERE a.assessment_id = %s AND m.case_ref = %s
+            ORDER BY d.document_type, v.field_name
+            """,
+            (assessment_id, case_ref),
+        )
+        return documents, _iso_rows(cur)
+
+
+def show_saved_iso(case_ref):
+    st.subheader("EE test PDF and ISO Excel")
+    st.caption(
+        "Original measurement evidence uploaded through Energy Measurements. "
+        "ISO annual estimates are not verified before-and-after savings."
+    )
+
+    assessments = _saved_iso_assessments(case_ref)
+    if not assessments:
+        st.info(f"No EE PDF and ISO Excel saved for {case_ref}")
         return
 
-    if action == "Correct values":
-        editable = pd.DataFrame([
+    lookup = {row["assessment_id"]: row for row in assessments}
+    assessment_id = st.selectbox(
+        "Saved assessment",
+        list(lookup),
+        format_func=lambda key: (
+            f"Assessment {key} | {lookup[key]['lift_id']} | "
+            f"{lookup[key]['imported_at']}"
+        ),
+        key=f"iso_assessment_{case_ref}",
+    )
+
+    documents, values = _saved_iso_details(case_ref, assessment_id)
+    st.caption(f"Assessment {assessment_id} | Case {case_ref}")
+
+    columns = st.columns(2)
+    for col, source_type, label, mime in (
+        (columns[0], "ee_pdf", "EE test PDF", "application/pdf"),
+        (
+            columns[1], "iso_excel", "ISO Excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+    ):
+        files = [item for item in documents if item["document_type"] == source_type]
+        with col:
+            st.metric(f"{label} fields", sum(
+                item["document_type"] == source_type for item in values
+            ))
+            if not files:
+                st.warning(f"{label} is missing from this assessment")
+                continue
+            source = files[0]
+            st.caption(source["filename"])
+            st.download_button(
+                f"Download {label}",
+                data=bytes(source["content"]),
+                file_name=source["filename"],
+                mime=mime,
+                key=f"iso_source_{assessment_id}_{source_type}",
+            )
+
+    st.subheader("Extracted source values")
+    selection = st.selectbox(
+        "Show evidence",
+        ["Both sources", "EE PDF", "ISO Excel"],
+        key=f"iso_evidence_filter_{assessment_id}",
+    )
+    source_filter = {"EE PDF": "ee_pdf", "ISO Excel": "iso_excel"}.get(selection)
+    filtered = [
+        item for item in values
+        if source_filter is None or item["document_type"] == source_filter
+    ]
+    st.dataframe(
+        [
             {
-                "Field key": key,
-                "Field": label,
-                "Source value": candidates[key]["raw_value"],
-                "Corrected value": candidates[key]["raw_value"],
+                "Source": "EE PDF" if item["document_type"] == "ee_pdf" else "ISO Excel",
+                "Field": item["field_name"],
+                "Value": item["value_text"],
+                "Unit": item["unit"] or "",
+                "PDF page": item["pdf_page"],
+                "Excel sheet": item["excel_sheet"],
+                "Excel cell": item["excel_cell"],
             }
-            for key, label in FIELD_LABELS.items()
-            if key != CALCULATED_FIELD
-        ])
-
-        st.caption(
-            "Update only the incorrect values and explain each correction"
-        )
-
-        with st.form(f"enercal_edit_{document_id}_{revision_no}"):
-            updated = st.data_editor(
-                editable,
-                hide_index=True,
-                num_rows="fixed",
-                width="stretch",
-                height=480,
-                disabled=[
-                    "Field key",
-                    "Field",
-                    "Source value",
-                ],
-                column_config={
-                    "Field key": None,
-                    "Field": st.column_config.TextColumn(
-                        "Field",
-                        width="large",
-                    ),
-                    "Source value": st.column_config.TextColumn(
-                        "Source value"
-                    ),
-                    "Corrected value": st.column_config.TextColumn(
-                        "Corrected value"
-                    ),
-                },
-                key=f"enercal_editor_{document_id}_{revision_no}",
-            )
-
-            note = st.text_area(
-                "Reason for corrections",
-                height=90,
-            )
-
-            checked = st.checkbox(
-                "I checked the corrected values against the source PDF"
-            )
-
-            submitted = st.form_submit_button(
-                "Save corrected values",
-                type="primary",
-            )
-
-        if submitted:
-            corrected = {
-                row["Field key"]: str(row["Corrected value"]).strip()
-                for row in updated.to_dict("records")
-            }
-
-            corrected[CALCULATED_FIELD] = (
-                candidates[CALCULATED_FIELD]["raw_value"]
-            )
-
-            if not note.strip():
-                st.error("Explain which values were corrected")
-
-            elif not checked:
-                st.error("Confirm that you checked the corrections")
-
-            else:
-                try:
-                    new_revision = resubmit_revision(
-                        document_id,
-                        corrected,
-                        note.strip(),
-                    )
-
-                except Exception as error:
-                    st.error(f"Corrections could not be saved {error}")
-
-                else:
-                    notify(f"Revision {new_revision} created for review")
-
-        return
-
-    with st.form(f"enercal_decision_{document_id}_{revision_no}"):
-        decisions = {
-            "changes_requested": "Request changes",
-            "further_verification_required": "Require further verification",
-            "rejected": "Reject report",
-        }
-
-        decision = st.selectbox(
-            "Decision",
-            list(decisions),
-            format_func=decisions.get,
-        )
-
-        reason = st.text_area(
-            "Reason for decision",
-            height=90,
-        )
-
-        submitted = st.form_submit_button("Save decision")
-
-    if submitted:
-        if not reason.strip():
-            st.error("Explain this decision")
-
-        else:
-            try:
-                review_revision(
-                    document_id,
-                    decision,
-                    reason.strip(),
-                )
-
-            except Exception as error:
-                st.error(f"Decision could not be saved {error}")
-
-            else:
-                notify(f"Revision {revision_no} updated")
+            for item in filtered
+        ],
+        hide_index=True,
+        width="stretch",
+        height=min(620, max(180, 36 * (len(filtered) + 1))),
+    )
+    st.caption(f"Showing {len(filtered)} of {len(values)} saved fields")
 
 
 # Only administrators can access review decisions and PDF source files.
@@ -485,13 +577,13 @@ with st.container(border=True):
     with saving_col:
         st.metric(
             "Energy saving",
-            f"{format_value(calculated)}%",
+            f"{format_value(calculated)}%" if calculated is not None else "N/A",
         )
 
     with reduction_col:
         st.metric(
             "Annual energy reduction",
-            f"{format_value(reduction)} kWh",
+            f"{format_value(reduction)} kWh" if reduction is not None else "N/A",
         )
 
 
@@ -499,8 +591,8 @@ st.caption(
     "Energy results are estimates and are not verified meter measurements"
 )
 
-overview_tab, data_tab, history_tab = st.tabs(
-    ["Overview", "PDF and data", "History"]
+overview_tab, data_tab, iso_tab, history_tab = st.tabs(
+    ["Overview", "PDF and data", "EE & ISO data", "History"]
 )
 
 
@@ -553,6 +645,7 @@ with overview_tab:
 
     st.write(
         f"EnerCal reported saving **{format_value(reported)}%**"
+        if reported is not None else "EnerCal reported saving **N/A**"
     )
 
     if status == "approved":
@@ -645,44 +738,12 @@ with data_tab:
         hide_index=True,
         width="stretch",
         column_config={
-            "Measure": st.column_config.TextColumn(
-                "Measure",
-                width="large",
-            ),
-            "Existing": st.column_config.TextColumn(
-                "Existing",
-                width="medium",
-            ),
-            "Proposed": st.column_config.TextColumn(
-                "Proposed",
-                width="medium",
-            ),
-            "Unit": st.column_config.TextColumn(
-                "Unit",
-                width="medium",
-            ),
+            "Measure": st.column_config.TextColumn("Measure", width="large"),
+            **{
+                name: st.column_config.TextColumn(name, width="medium")
+                for name in ("Existing", "Proposed", "Unit")
+            },
         },
-    )
-
-    st.subheader("Energy saving results")
-
-    st.dataframe(
-        [
-            {
-                "Measure": "Reported saving",
-                "Value": f"{format_value(reported)}%",
-            },
-            {
-                "Measure": "Calculated saving",
-                "Value": f"{format_value(calculated)}%",
-            },
-        ],
-        hide_index=True,
-        width="stretch",
-    )
-
-    st.caption(
-        "The comparison includes all 16 extracted values"
     )
 
     with st.expander("Profile and engineering information"):
@@ -705,6 +766,12 @@ with data_tab:
         candidates,
     )
 
+
+with iso_tab:
+    try:
+        show_saved_iso(str(report_lookup[document_id][1]))
+    except Exception as error:
+        st.error(f"Could not load saved EE and ISO data: {error}")
 
 with history_tab:
     st.subheader("Revision history")
