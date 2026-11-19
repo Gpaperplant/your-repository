@@ -123,6 +123,19 @@ class ISOExcelPageTests(unittest.TestCase):
         self.assertEqual(json.loads(ui.exports[0])["lift_id"], "OP13 (L)")
         self.assertEqual(calls["save"], 0)
 
+    def test_preview_value_column_is_text_without_changing_json(self):
+        examples = [
+            RECORDS[0], RECORDS[1],
+            {"field": "before_efficiency_class", "value": "C", "kind": "calculated", "sheet": "Classification", "cell": "C7"},
+            {"field": "not_calculated", "value": None, "kind": "calculated", "sheet": "Calculation", "cell": "C15"},
+        ]
+        ui, _ = render(extract=lambda _: examples)
+        self.assertEqual([row["Value"] for row in ui.tables[0]], ["OP13 (L)", "41933.05", "C", ""])
+        self.assertTrue(all(isinstance(row["Value"], str) for row in ui.tables[0]))
+        exported = json.loads(ui.exports[0])
+        self.assertEqual(exported["fields"][1]["value"], 41933.05)
+        self.assertIsNone(exported["fields"][-1]["value"])
+
     def test_save_success_and_no_filled_message(self):
         ui, calls = render(clicked=True)
         self.assertEqual(calls, {"extract": 1, "save": 1})

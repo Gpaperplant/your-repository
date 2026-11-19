@@ -53,7 +53,7 @@ def main():
         [
             {
                 "Field": item["field"],
-                "Value": item.get("value"),
+                "Value": "" if item.get("value") is None else str(item["value"]),
                 "Unit": item.get("unit") or "",
                 "Excel sheet": item.get("sheet") or "",
                 "Excel cell": item.get("cell") or "",

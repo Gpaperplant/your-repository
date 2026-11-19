@@ -283,7 +283,7 @@ with st.expander("Additional extracted information"):
         [
             {
                 "Field": key.replace("_", " ").capitalize(),
-                "Value": value,
+                "Value": "" if value is None else str(value),
                 "Unit": unit or "",
                 "Page": page,
             }

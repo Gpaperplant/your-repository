@@ -146,7 +146,7 @@ def show_specifications(specifications, document_id):
 
         row = {
             "Field": SPEC_LABELS.get(name, name),
-            "Value": value,
+            "Value": "" if value is None else str(value),
             "Unit": item["Unit"],
         }
 
@@ -409,7 +409,7 @@ def show_saved_iso(case_ref):
         [
             {
                 "Field": item["field_name"],
-                "Value": item["value_text"],
+                "Value": "" if item["value_text"] is None else str(item["value_text"]),
                 "Unit": item["unit"] or "",
                 "Excel sheet": item["excel_sheet"],
                 "Excel cell": item["excel_cell"],

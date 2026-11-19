@@ -318,6 +318,31 @@ class TestSavedIsoTab(unittest.TestCase):
         self.assertEqual(set(rows[0]), {"Field", "Value", "Unit", "Excel sheet", "Excel cell"})
         self.assertIn(("ISO Excel fields", 1), ui.metrics)
 
+    def test_iso_display_values_are_text_for_arrow(self):
+        _, ui, _ = render(values=[
+            {"field_name": "rated_load_kg", "value_text": 1635, "unit": "kg",
+             "excel_sheet": "Lift parameters", "excel_cell": "C5"},
+            {"field_name": "source_note", "value_text": "Updated model", "unit": None,
+             "excel_sheet": "Test parameters", "excel_cell": "C3"},
+            {"field_name": "unknown", "value_text": None, "unit": None,
+             "excel_sheet": "Calculation", "excel_cell": "C20"},
+        ])
+        rows = next(table for table in ui.tables if table and table[0].get("Field") == "rated_load_kg")
+        self.assertEqual([row["Value"] for row in rows], ["1635", "Updated model", ""])
+        self.assertTrue(all(isinstance(row["Value"], str) for row in rows))
+
+    def test_enercal_specification_values_are_text_for_arrow(self):
+        page, ui, _ = render()
+        page.show_specifications([
+            {"Field": "Company", "Value": "KONE", "Unit": "", "Source page": 2},
+            {"Field": "Rated load", "Value": 1635, "Unit": "kg", "Source page": 2},
+            {"Field": "Energy", "Value": 22084.07, "Unit": "kWh", "Source page": 2},
+            {"Field": "Missing", "Value": None, "Unit": "", "Source page": 2},
+        ], 63)
+        rows = next(table for table in ui.tables if table and table[0].get("Field") == "Company")
+        self.assertEqual([row["Value"] for row in rows], ["KONE", "1635", "22084.07", ""])
+        self.assertTrue(all(isinstance(row["Value"], str) for row in rows))
+
     def test_case_and_assessment_scope(self):
         _, _, cursor = render()
         self.assertEqual(len(cursor.requests), 3)
