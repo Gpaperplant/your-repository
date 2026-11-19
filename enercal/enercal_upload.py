@@ -125,7 +125,7 @@ st.caption(
 message = st.session_state.pop("enercal_case_created", None)
 
 if message:
-    st.success(message)
+    st.write(f":green[{message}]")
 
 
 try:
@@ -137,7 +137,7 @@ except Exception as error:
 
 with st.expander("Register a new case", expanded=not bool(cases)):
     if not elevators:
-        st.info("Register an elevator before creating a case")
+        st.write("Register an elevator before creating a case")
 
     with st.form("enercal_create_case", clear_on_submit=True):
         new_ref = st.text_input(
@@ -191,7 +191,7 @@ st.divider()
 st.subheader("Upload report")
 
 if not cases:
-    st.info("Create a modernisation case to continue")
+    st.write("Create a modernisation case to continue")
     st.stop()
 
 
@@ -208,7 +208,7 @@ uploaded = st.file_uploader(
 )
 
 if uploaded is None:
-    st.info("Choose a PDF to preview its energy comparison")
+    st.write("Choose a PDF to preview its energy comparison")
     st.stop()
 
 
@@ -227,7 +227,7 @@ except Exception as error:
 
 
 if existing_id is not None:
-    st.info(
+    st.write(
         f"This report is already saved as document {existing_id}"
     )
     st.stop()
@@ -308,12 +308,12 @@ if st.button("Save report", type="primary"):
         st.error(f"Could not save report {error}")
 
     else:
-        st.success(
-            f'Report {result["document_id"]} saved with '
+        st.write(
+            f':green[Report {result["document_id"]} saved with '
             f'{result["fields_saved"]} comparison fields and '
-            f'{result["additional_fields_saved"]} additional fields'
+            f'{result["additional_fields_saved"]} additional fields]'
         )
 
-        st.info(
+        st.write(
             "Open Case Workspace to review and approve the extracted data"
         )

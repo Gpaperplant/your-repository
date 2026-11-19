@@ -1,4 +1,4 @@
-"""EnerCal case tracking, approved KPI estimates, and verified energy savings."""
+"""Show approved EnerCal KPIs and saved ISO Excel assessments."""
 
 from decimal import Decimal
 
@@ -16,6 +16,14 @@ METRICS = (
     ("lifetime_cost", "Lifetime electricity cost", "lifetime_electricity_cost"),
     ("operational_co2e", "Operational CO₂e", "operational_co2e_kg_lifetime"),
     ("embodied_co2e", "Embodied CO₂e", "embodied_co2e_kg"),
+)
+
+# Read only the ISO result fields needed for the overview.
+ISO_FIELDS = (
+    "before_annual_energy_kwh", "after_annual_energy_kwh",
+    "before_annual_energy_wh", "after_annual_energy_wh",
+    "before_efficiency_class", "after_efficiency_class",
+    "annual_energy_kwh", "annual_energy_wh", "efficiency_class",
 )
 
 
@@ -77,6 +85,79 @@ def load_reports():
     ]
 
 
+def load_iso_reports():
+    """Load the latest saved ISO Excel assessment for every modernisation case."""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT m.case_ref, a.assessment_id, a.lift_id, a.imported_at,
+                   a.review_status, d.filename, v.field_name, v.numeric_value, v.value_text
+            FROM iso_assessments a
+            JOIN modernisation_cases m ON m.case_id = a.case_id
+            JOIN iso_documents d ON d.assessment_id = a.assessment_id
+                                AND d.document_type = 'iso_excel'
+            LEFT JOIN iso_extracted_values v ON v.document_id = d.document_id
+                                            AND v.field_name = ANY(%s)
+            WHERE a.assessment_id = (
+                SELECT latest.assessment_id
+                FROM iso_assessments latest
+                WHERE latest.case_id = a.case_id
+                ORDER BY latest.imported_at DESC, latest.assessment_id DESC
+                LIMIT 1
+            )
+            ORDER BY m.case_ref, v.field_name
+        """, (list(ISO_FIELDS),))
+        rows = _rows(cur)
+
+    reports = {}
+    for row in rows:
+        case = row["case_ref"]
+        report = reports.setdefault(case, {
+            "case_ref": case,
+            "assessment_id": row["assessment_id"],
+            "lift_id": row["lift_id"],
+            "imported_at": row["imported_at"],
+            "review_status": row["review_status"],
+            "filename": row["filename"],
+            "values": {},
+        })
+        if row["field_name"] is not None:
+            report["values"][row["field_name"]] = (
+                row["numeric_value"] if row["numeric_value"] is not None
+                else row["value_text"]
+            )
+    return list(reports.values())
+
+
+def iso_annual_energy(report, role=""):
+    """Use kWh where available; otherwise convert stored Wh to kWh."""
+    values = report["values"]
+    kwh = values.get(f"{role}annual_energy_kwh")
+    wh = values.get(f"{role}annual_energy_wh")
+    try:
+        if kwh is not None:
+            number = Decimal(str(kwh))
+        elif wh is not None:
+            number = Decimal(str(wh)) / Decimal("1000")
+        else:
+            return None
+        return number if number.is_finite() and number >= 0 else None
+    except (ArithmeticError, ValueError):
+        return None
+
+
+def iso_saving(report):
+    """Calculate the ISO estimate from stored before/after annual energy."""
+    before = iso_annual_energy(report, "before_")
+    after = iso_annual_energy(report, "after_")
+    if before is None or before == 0 or after is None:
+        return None
+    return (before - after) * 100 / before
+
+
+def iso_display(value):
+    return f"{value:,.2f}" if value is not None else "N/A"
+
+
 def display(value):
     """Missing values are N/A, never zero."""
     if value is None or value == "":
@@ -102,6 +183,26 @@ def status_label(row, approved_ids):
     if row["review_status"] == "approved" and row["document_id"] not in approved_ids:
         return "Approved (KPI data unavailable)"
     return str(row["review_status"]).replace("_", " ").title()
+
+
+def case_readiness(statuses, iso_reports):
+    """Only the latest MOD PDF and latest ISO workbook can make a case Ready."""
+    latest_mod = {}
+    for row in statuses:
+        case, document_id = row["case_ref"], row["document_id"]
+        if document_id is not None and (
+            case not in latest_mod or document_id > latest_mod[case]["document_id"]
+        ):
+            latest_mod[case] = row
+
+    iso_by_case = {report["case_ref"]: report for report in iso_reports}
+    return {
+        case: (
+            latest_mod.get(case, {}).get("review_status") == "approved"
+            and iso_by_case.get(case, {}).get("review_status") == "approved"
+        )
+        for case in {row["case_ref"] for row in statuses}
+    }
 
 
 def metric_unit(key, report):
@@ -140,18 +241,22 @@ def comparable_unit(key, reports):
     return True, ""
 
 
-def show_case_overview(statuses, reports):
+def show_case_overview(statuses, reports, iso_reports=()):
     """Dropdowns filter the table only; summary cards use unfiltered data."""
     approved_ids = {r["document_id"] for r in reports}
+    iso_by_case = {r["case_ref"]: r for r in iso_reports}
+    ready_by_case = case_readiness(statuses, iso_reports)
     st.subheader("Modernisation cases and report status")
-    a, b, c, d = st.columns(4)
+    a, b, c, d, e, f = st.columns(6)
     a.metric("Modernisation cases", len({r["case_ref"] for r in statuses}))
     b.metric("Without PDF", len({r["case_ref"] for r in statuses if r["document_id"] is None}))
     c.metric("Pending reports", sum(r["review_status"] == "pending" for r in statuses))
     d.metric("Approved KPI reports", len(reports))
+    e.metric("Cases with ISO Excel", len(iso_by_case))
+    f.metric("Ready cases", sum(ready_by_case.values()))
 
     if not statuses:
-        st.info("No modernisation cases are registered yet.")
+        st.write("No modernisation cases are registered yet.")
         return
 
     chosen_case = st.selectbox(
@@ -171,7 +276,7 @@ def show_case_overview(statuses, reports):
     ]
     st.caption(f"Showing {len(visible)} of {len(statuses)} case/report records.")
     if not visible:
-        st.info("No cases match those status filters.")
+        st.write("No cases match those status filters.")
         return
     st.dataframe([
         {
@@ -181,9 +286,17 @@ def show_case_overview(statuses, reports):
             "PDF": r["filename"] or "",
             "Revision": r["revision_no"],
             "Engineering status": status_label(r, approved_ids),
+            "ISO Excel": iso_by_case[r["case_ref"]]["filename"]
+            if r["case_ref"] in iso_by_case else "",
+            "ISO status": (
+                iso_by_case[r["case_ref"]]["review_status"].replace("_", " ").title()
+                if r["case_ref"] in iso_by_case else "Not uploaded"
+            ),
+            "Case readiness": "Ready" if ready_by_case[r["case_ref"]] else "Not ready",
         }
         for r in visible
     ], hide_index=True, width="stretch")
+    st.caption("Ready requires approval of the latest MOD PDF and latest ISO Excel workbook for the case.")
 
 
 def show_approved_comparison(reports):
@@ -200,7 +313,7 @@ def show_approved_comparison(reports):
     key = next(key for key, name, _ in METRICS if name == label)
     compatible, reason = comparable_unit(key, reports)
     if not compatible:
-        st.info(reason)
+        st.write(reason)
 
     unit = metric_unit(key, reports[0]) if compatible else None
     rows = []
@@ -225,60 +338,12 @@ def show_approved_comparison(reports):
         or report[f"proposed_{key}"] is not None
         for report in reports
     ):
-        st.info("No usable values for this KPI.")
+        st.write("No usable values for this KPI.")
 
     st.dataframe(rows, hide_index=True, width="stretch")
     st.caption(
         "Each report is listed separately. Figures are EnerCal estimates, "
         "not verified meter savings; alternative proposals are not summed."
-    )
-
-
-def show_verified_measurements():
-    """Read verified pairs independently; a failure must not block approved PDFs."""
-    st.subheader("Measured vs estimated energy savings")
-    try:
-        from services.verified_savings_reporting import load_verified_savings
-        measured = load_verified_savings()
-    except Exception as error:
-        st.error(f"Could not load verified measurements: {error}")
-        return
-
-    st.metric("Eligible verified measurement pairs", len(measured))
-    if not measured:
-        st.info("No eligible verified meter-reading pairs yet.")
-        return
-
-    chosen_case = st.selectbox(
-        "Filter measured results by case",
-        ["All measured cases", *sorted({r["case_ref"] for r in measured})],
-        key="enercal_verified_case_filter",
-    )
-    visible = [
-        r for r in measured
-        if chosen_case == "All measured cases" or r["case_ref"] == chosen_case
-    ]
-    st.dataframe([
-        {
-            "Case": r["case_ref"],
-            "Pair ID": r["pair_id"],
-            "EnerCal PDF ID": r["document_id"],
-            "Elevator ID": r["elevator_id"],
-            "Before period": f'{r["before_start"]} to {r["before_end"]}',
-            "After period": f'{r["after_start"]} to {r["after_end"]}',
-            "Before (kWh/day)": display(r["measured_before_kwh_per_day"]),
-            "After (kWh/day)": display(r["measured_after_kwh_per_day"]),
-            "Observed saving (%)": display(r["measured_saving_percent"]),
-            "EnerCal estimate (%)": display(r["enercal_estimated_saving_percent"]),
-            "Observed − estimated (pp)": display(r["measured_minus_estimated_pp"]),
-            "Estimate availability": r["estimate_status"],
-        }
-        for r in visible
-    ], hide_index=True, width="stretch")
-
-    st.caption(
-        "Observed and estimated savings are compared as percentages for the "
-        "same PDF; differences are percentage points (pp)."
     )
 
 
@@ -334,25 +399,71 @@ def show_report_details(reports):
     )
 
 
+def show_iso_reports(iso_reports, ready_by_case=None):
+    """Show ISO estimates, review decisions and case readiness."""
+    if not iso_reports:
+        return
+    st.subheader("ISO Excel energy assessments")
+    rows = []
+    ready_by_case = ready_by_case or {}
+    has_single_column = any(iso_annual_energy(r) is not None for r in iso_reports)
+    for report in sorted(iso_reports, key=lambda r: r["case_ref"]):
+        values = report["values"]
+        rows.append({
+            "Case": report["case_ref"],
+            "ISO assessment": report["assessment_id"],
+            "Excel workbook": report["filename"],
+            "Lift": report["lift_id"],
+            "Before (kWh/year)": iso_display(iso_annual_energy(report, "before_")),
+            "After (kWh/year)": iso_display(iso_annual_energy(report, "after_")),
+            "ISO saving (%)": iso_display(iso_saving(report)),
+            "Before class": display(values.get("before_efficiency_class")),
+            "After class": display(values.get("after_efficiency_class")),
+            **({"Single-column energy (kWh/year)": iso_display(iso_annual_energy(report))}
+               if has_single_column else {}),
+            "Evidence status": report["review_status"].replace("_", " ").title(),
+            "Case readiness": "Ready" if ready_by_case.get(report["case_ref"]) else "Not ready",
+        })
+    st.dataframe(rows, hide_index=True, width="stretch")
+    st.caption(
+        "Latest ISO Excel workbook per case. Values are estimates, not verified "
+        "meter savings. ISO approval is a separate engineering decision."
+    )
+    st.download_button(
+        "Download ISO Excel summary",
+        data=pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig"),
+        file_name="iso_excel_assessments.csv",
+        mime="text/csv",
+    )
+
+
 def main():
     if st.session_state.get("role") != "Admin":
         st.error("Admin access is required")
         st.stop()
 
-    st.subheader("EnerCal | Sustainability KPI Reporting")
+    st.subheader("Modernisation | Sustainability KPI Overview")
     try:
-        statuses, reports = load_case_statuses(), load_reports()
+        statuses, reports, iso_reports = (
+            load_case_statuses(), load_reports(), load_iso_reports()
+        )
     except Exception as error:
         st.error(f"Could not load reporting data: {error}")
         st.stop()
 
-    show_case_overview(statuses, reports)
-    show_verified_measurements()
-    if not reports:
-        st.info("No complete engineering-approved EnerCal reports yet.")
-        return
-    show_approved_comparison(reports)
-    show_report_details(reports)
+    show_case_overview(statuses, reports, iso_reports)
+    if reports:
+        st.markdown("<div style='height: 2rem'></div>", unsafe_allow_html=True)
+        if len(reports) >= 2:
+            show_approved_comparison(reports)
+            st.markdown("<div style='height: 2rem'></div>", unsafe_allow_html=True)
+        show_report_details(reports)
+    else:
+        st.write("No complete engineering-approved EnerCal reports yet.")
+
+    if iso_reports:
+        st.markdown("<div style='height: 2rem'></div>", unsafe_allow_html=True)
+        show_iso_reports(iso_reports, case_readiness(statuses, iso_reports))
 
 
 main()

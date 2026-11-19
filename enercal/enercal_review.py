@@ -8,6 +8,7 @@ import pandas as pd
 import pymupdf
 import streamlit as st
 
+from services.iso_repository import review_iso_assessment
 from services.enercal_review_repository import (
     CALCULATED_FIELD,
     EDITABLE_STATUSES,
@@ -111,7 +112,7 @@ def comparison_table(candidates):
 
 def show_specifications(specifications, document_id):
     if not specifications:
-        st.info("No additional information was extracted")
+        st.write("No additional information was extracted")
         return
 
     groups = {
@@ -273,39 +274,13 @@ def _correct_review(document_id, revision_no, candidates):
     )
 
 
-def _other_decision(document_id, revision_no):
-    decisions = {
-        "changes_requested": "Request changes",
-        "further_verification_required": "Require further verification",
-        "rejected": "Reject report",
-    }
-    with st.form(f"enercal_decision_{document_id}_{revision_no}"):
-        decision = st.selectbox(
-            "Decision", list(decisions), format_func=decisions.get
-        )
-        reason = st.text_area("Reason for decision", height=90)
-        submitted = st.form_submit_button("Save decision")
-
-    if not submitted:
-        return
-    if not reason.strip():
-        st.error("Explain this decision")
-        return
-
-    _save_review(
-        lambda: review_revision(document_id, decision, reason.strip()),
-        f"Revision {revision_no} updated",
-        error_label="Decision",
-    )
-
-
 def review_forms(document_id, revision_no, status, candidates):
     if status not in EDITABLE_STATUSES:
-        st.info("This revision is read only and its decisions remain in History")
+        st.write("This revision is read only and its decisions remain in History")
         return
 
     choices = (
-        ["Approve", "Correct values", "Other decision"]
+        ["Approve", "Correct values"]
         if status == "pending"
         else ["Confirm unchanged", "Correct values"]
     )
@@ -319,8 +294,6 @@ def review_forms(document_id, revision_no, status, candidates):
         _confirm_review(document_id, revision_no, action)
     elif action == "Correct values":
         _correct_review(document_id, revision_no, candidates)
-    else:
-        _other_decision(document_id, revision_no)
 
 
 def _iso_rows(cur):
@@ -329,16 +302,21 @@ def _iso_rows(cur):
 
 
 def _saved_iso_assessments(case_ref):
-    # Match assessments to the case selected in the EnerCal workspace.
     from database import get_connection
 
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT a.assessment_id, a.lift_id, a.imported_at
+            SELECT a.assessment_id, a.lift_id, a.imported_at,
+                   a.review_status, a.reviewed_at, a.review_note
             FROM iso_assessments a
             JOIN modernisation_cases m ON m.case_id = a.case_id
             WHERE m.case_ref = %s
+              AND EXISTS (
+                  SELECT 1 FROM iso_documents d
+                  WHERE d.assessment_id = a.assessment_id
+                    AND d.document_type = 'iso_excel'
+              )
             ORDER BY a.imported_at DESC, a.assessment_id DESC
             """,
             (case_ref,),
@@ -347,18 +325,17 @@ def _saved_iso_assessments(case_ref):
 
 
 def _saved_iso_details(case_ref, assessment_id):
-    # Validate the case association in both read-only queries.
     from database import get_connection
 
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT d.document_id, d.document_type, d.filename, d.content
+            SELECT d.document_id, d.filename, d.content
             FROM iso_documents d
             JOIN iso_assessments a ON a.assessment_id = d.assessment_id
             JOIN modernisation_cases m ON m.case_id = a.case_id
             WHERE a.assessment_id = %s AND m.case_ref = %s
-            ORDER BY d.document_type
+              AND d.document_type = 'iso_excel'
             """,
             (assessment_id, case_ref),
         )
@@ -366,14 +343,15 @@ def _saved_iso_details(case_ref, assessment_id):
 
         cur.execute(
             """
-            SELECT d.document_type, v.field_name, v.value_text, v.unit,
-                   v.data_kind, v.pdf_page, v.excel_sheet, v.excel_cell
+            SELECT v.field_name, v.value_text, v.unit,
+                   v.excel_sheet, v.excel_cell
             FROM iso_extracted_values v
             JOIN iso_documents d ON d.document_id = v.document_id
             JOIN iso_assessments a ON a.assessment_id = d.assessment_id
             JOIN modernisation_cases m ON m.case_id = a.case_id
             WHERE a.assessment_id = %s AND m.case_ref = %s
-            ORDER BY d.document_type, v.field_name
+              AND d.document_type = 'iso_excel'
+            ORDER BY v.field_name
             """,
             (assessment_id, case_ref),
         )
@@ -381,15 +359,12 @@ def _saved_iso_details(case_ref, assessment_id):
 
 
 def show_saved_iso(case_ref):
-    st.subheader("EE test PDF and ISO Excel")
-    st.caption(
-        "Original measurement evidence uploaded through Energy Measurements. "
-        "ISO annual estimates are not verified before-and-after savings."
-    )
+    st.subheader("Saved ISO Excel calculations")
+    st.caption("Review original ISO workbooks and their extracted values.")
 
     assessments = _saved_iso_assessments(case_ref)
     if not assessments:
-        st.info(f"No EE PDF and ISO Excel saved for {case_ref}")
+        st.write(f"No ISO Excel saved for {case_ref}")
         return
 
     lookup = {row["assessment_id"]: row for row in assessments}
@@ -405,62 +380,74 @@ def show_saved_iso(case_ref):
 
     documents, values = _saved_iso_details(case_ref, assessment_id)
     st.caption(f"Assessment {assessment_id} | Case {case_ref}")
-
-    columns = st.columns(2)
-    for col, source_type, label, mime in (
-        (columns[0], "ee_pdf", "EE test PDF", "application/pdf"),
-        (
-            columns[1], "iso_excel", "ISO Excel",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ),
-    ):
-        files = [item for item in documents if item["document_type"] == source_type]
-        with col:
-            st.metric(f"{label} fields", sum(
-                item["document_type"] == source_type for item in values
-            ))
-            if not files:
-                st.warning(f"{label} is missing from this assessment")
-                continue
-            source = files[0]
-            st.caption(source["filename"])
-            st.download_button(
-                f"Download {label}",
-                data=bytes(source["content"]),
-                file_name=source["filename"],
-                mime=mime,
-                key=f"iso_source_{assessment_id}_{source_type}",
-            )
-
-    st.subheader("Extracted source values")
-    selection = st.selectbox(
-        "Show evidence",
-        ["Both sources", "EE PDF", "ISO Excel"],
-        key=f"iso_evidence_filter_{assessment_id}",
+    review = lookup[assessment_id]
+    review_status = review["review_status"]
+    st.write(
+        f"ISO engineering status: **{STATUS_LABELS.get(review_status, review_status.title())}**"
     )
-    source_filter = {"EE PDF": "ee_pdf", "ISO Excel": "iso_excel"}.get(selection)
-    filtered = [
-        item for item in values
-        if source_filter is None or item["document_type"] == source_filter
-    ]
+    if review.get("reviewed_at"):
+        st.caption(f"Reviewed: {review['reviewed_at']}")
+    if review.get("review_note"):
+        st.write(f"Review note: {review['review_note']}")
+    st.metric("ISO Excel fields", len(values))
+
+    if documents:
+        source = documents[0]
+        st.caption(source["filename"])
+        st.download_button(
+            "Download ISO Excel",
+            data=bytes(source["content"]),
+            file_name=source["filename"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"iso_source_{assessment_id}",
+        )
+    else:
+        st.warning("The saved ISO Excel file is unavailable.")
+
+    st.subheader("Extracted ISO values")
     st.dataframe(
         [
             {
-                "Source": "EE PDF" if item["document_type"] == "ee_pdf" else "ISO Excel",
                 "Field": item["field_name"],
                 "Value": item["value_text"],
                 "Unit": item["unit"] or "",
-                "PDF page": item["pdf_page"],
                 "Excel sheet": item["excel_sheet"],
                 "Excel cell": item["excel_cell"],
             }
-            for item in filtered
+            for item in values
         ],
         hide_index=True,
         width="stretch",
-        height=min(620, max(180, 36 * (len(filtered) + 1))),
+        height=min(620, max(180, 36 * (len(values) + 1))),
     )
-    st.caption(f"Showing {len(filtered)} of {len(values)} saved fields")
+    st.caption(f"Showing {len(values)} saved fields")
+
+    # Only the latest pending ISO workbook can receive a new decision.
+    if assessment_id != assessments[0]["assessment_id"]:
+        st.caption("An older ISO assessment is read only.")
+    elif review_status == "pending" and documents and values:
+        st.subheader("ISO engineering review")
+        st.caption("Check the original workbook and extracted values before approving.")
+        decision = st.selectbox(
+            "ISO review decision", ["Choose decision", "Approve", "Reject"],
+            key=f"iso_decision_{assessment_id}",
+        )
+        note = st.text_input("ISO review note", key=f"iso_note_{assessment_id}")
+        if st.button(
+            "Submit ISO review", type="primary",
+            disabled=decision == "Choose decision",
+            key=f"iso_submit_{assessment_id}",
+        ):
+            try:
+                review_iso_assessment(
+                    case_ref, assessment_id,
+                    "approved" if decision == "Approve" else "rejected", note,
+                )
+            except Exception as error:
+                st.error(f"Could not submit ISO review: {error}")
+            else:
+                result = "approved" if decision == "Approve" else "rejected"
+                notify(f"ISO assessment {assessment_id} {result}.")
 
 
 # Only administrators can access review decisions and PDF source files.
@@ -478,7 +465,7 @@ message = st.session_state.pop(
 )
 
 if message:
-    st.success(message)
+    st.write(f":green[{message}]")
 
 
 try:
@@ -490,7 +477,7 @@ except Exception as error:
 
 
 if not documents:
-    st.info("No MOD reports have been uploaded")
+    st.write("No MOD reports have been uploaded")
     st.stop()
 
 
@@ -592,7 +579,7 @@ st.caption(
 )
 
 overview_tab, data_tab, iso_tab, history_tab = st.tabs(
-    ["Overview", "PDF and data", "EE & ISO data", "History"]
+    ["Overview", "PDF and data", "ISO Excel data", "History"]
 )
 
 
@@ -641,7 +628,7 @@ with overview_tab:
         )
 
     else:
-        st.info("Annual energy data is unavailable")
+        st.write("Annual energy data is unavailable")
 
     st.write(
         f"EnerCal reported saving **{format_value(reported)}%**"
@@ -649,15 +636,15 @@ with overview_tab:
     )
 
     if status == "approved":
-        st.success(
-            "This revision is approved for KPI reporting"
+        st.write(
+            ":green[This revision is approved for KPI reporting]"
         )
 
     elif status == "rejected":
         st.warning("This revision was rejected")
 
     else:
-        st.info(
+        st.write(
             "Open PDF and data to check values and complete the review"
         )
 
@@ -771,7 +758,7 @@ with iso_tab:
     try:
         show_saved_iso(str(report_lookup[document_id][1]))
     except Exception as error:
-        st.error(f"Could not load saved EE and ISO data: {error}")
+        st.error(f"Could not load saved ISO Excel data: {error}")
 
 with history_tab:
     st.subheader("Revision history")
@@ -797,7 +784,7 @@ with history_tab:
         )
 
     else:
-        st.info(
+        st.write(
             "No revision history is available"
         )
 
@@ -829,6 +816,6 @@ with history_tab:
         )
 
     else:
-        st.info(
+        st.write(
             "No review events have been recorded"
         )

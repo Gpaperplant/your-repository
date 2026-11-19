@@ -1,337 +1,280 @@
+"""Regression tests for ISO Excel-only import and database persistence."""
 
 import hashlib
+import importlib.util
+import sys
 import unittest
-from unittest.mock import patch
-
-from services.iso_import_service import process_iso_pair
-from services.iso_pair_validator import (
-    index_values,
-    normalise_lift_id,
-    validate_same_lift,
-)
-from services.iso_repository import save_iso_assessment
-
-
-def sample_records():
-    # Representative OP13 fields and permitted descriptive differences.
-    pdf = [
-        {"field": "lift_id", "value": "OP13 (L)", "kind": "identity"},
-        {"field": "rated_load_kg", "value": 1635, "kind": "specification"},
-        {"field": "rated_speed_m_s", "value": 7, "kind": "specification"},
-        {"field": "travel_m", "value": 198.1, "kind": "specification"},
-        {"field": "stops", "value": 19, "kind": "specification"},
-        {"field": "test_date", "value": "2025-05-21", "kind": "metadata"},
-        {"field": "reference_energy_wh", "value": 250.541, "kind": "measured"},
-        {"field": "annual_energy_kwh", "value": 22084.08, "kind": "reported"},
-        {
-            "field": "lift_model",
-            "value": "KONE MiniSpace (PT24/70-19)",
-            "kind": "specification",
-        },
-        {"field": "instrument_model", "value": "Fluke 1738", "kind": "metadata"},
-        {"field": "serial_number", "value": "42954853", "kind": "identity"},
-    ]
-
-    excel = [
-        {"field": "lift_id", "value": "OP13(L)", "kind": "identity"},
-        {"field": "rated_load_kg", "value": 1635, "kind": "specification"},
-        {"field": "rated_speed_m_s", "value": 7, "kind": "specification"},
-        {"field": "travel_m", "value": 198.1, "kind": "specification"},
-        {"field": "stops", "value": 19, "kind": "specification"},
-        {"field": "test_date", "value": "2025-05-21", "kind": "metadata"},
-        {"field": "reference_energy_wh", "value": 250.541, "kind": "measured"},
-        {"field": "annual_energy_kwh", "value": 22084.07, "kind": "calculated"},
-        {
-            "field": "lift_model",
-            "value": "KONE MiniSpace, traction lift",
-            "kind": "specification",
-        },
-        {
-            "field": "instrument_model",
-            "value": "Fluke 1736/1738",
-            "kind": "metadata",
-        },
-        {"field": "daily_trips_iso_assumed", "value": 750, "kind": "assumed"},
-    ]
-
-    return pdf, excel
-
-
-def change(records, field, value):
-    next(
-        row for row in records if row["field"] == field
-    )["value"] = value
-
-
-class TestPairValidator(unittest.TestCase):
-    def setUp(self):
-        self.pdf, self.excel = sample_records()
-
-    def test_lift_id_normalisation(self):
-        self.assertEqual(
-            normalise_lift_id("OP13 (L)"),
-            normalise_lift_id("OP13(L)"),
-        )
-
-    def test_valid_pair(self):
-        result = validate_same_lift(self.pdf, self.excel)
-        self.assertEqual(result["lift_id"], "OP13 (L)")
-        self.assertEqual(len(result["checked_specs"]), 4)
-
-    def test_wrong_lift_rejected(self):
-        change(self.excel, "lift_id", "OP21")
-
-        with self.assertRaisesRegex(ValueError, "Lift ID mismatch"):
-            validate_same_lift(self.pdf, self.excel)
-
-    def test_wrong_speed_rejected(self):
-        change(self.excel, "rated_speed_m_s", 5)
-
-        with self.assertRaisesRegex(ValueError, "rated_speed_m_s"):
-            validate_same_lift(self.pdf, self.excel)
-
-    def test_insufficient_identity_rejected(self):
-        self.excel = [
-            row for row in self.excel
-            if row["field"] in {"lift_id", "rated_load_kg"}
-        ]
-
-        with self.assertRaisesRegex(ValueError, "three matching"):
-            validate_same_lift(self.pdf, self.excel)
-
-    def test_rounding_accepted(self):
-        result = validate_same_lift(self.pdf, self.excel)
-        differences = {
-            row["field"] for row in result["differences"]
-        }
-        self.assertNotIn("annual_energy_kwh", differences)
-
-    def test_unique_fields_preserved(self):
-        result = validate_same_lift(self.pdf, self.excel)
-        self.assertIn("serial_number", result["pdf_only"])
-        self.assertIn("daily_trips_iso_assumed", result["excel_only"])
-
-    def test_duplicate_field_rejected(self):
-        self.pdf.append(dict(self.pdf[0]))
-
-        with self.assertRaisesRegex(ValueError, "Duplicate"):
-            index_values(self.pdf)
-
-
-class TestImportService(unittest.TestCase):
-    def setUp(self):
-        self.pdf_records, self.excel_records = sample_records()
-
-        # Mock external extraction and database operations.
-        targets = {
-            "preview": (
-                "services.iso_import_service.read_and_merge_iso_assessment",
-                {
-                    "review_status": "RECONCILED",
-                    "elevator_id": "OP13 (L)",
-                    "conflicting_fields": [],
-                    "missing_fields": [],
-                },
-            ),
-            "pdf": (
-                "services.iso_import_service.extract_ee_pdf",
-                self.pdf_records,
-            ),
-            "excel": (
-                "services.iso_import_service.extract_iso_excel",
-                self.excel_records,
-            ),
-            "case": (
-                "services.iso_import_service.get_case_elevator",
-                (1, "OP13 (L)"),
-            ),
-            "save": (
-                "services.iso_import_service.save_iso_assessment",
-                {"assessment_id": 10, "created": True},
-            ),
-        }
-
-        self.mocks = {}
-
-        for name, (target, value) in targets.items():
-            patcher = patch(target, return_value=value)
-            self.mocks[name] = patcher.start()
-            self.addCleanup(patcher.stop)
-
-    def import_pair(
-        self,
-        pdf_bytes=b"%PDF-1.7",
-        excel_bytes=b"PK\x03\x04",
-    ):
-        return process_iso_pair(
-            "MOD1001",
-            "OP13.pdf",
-            pdf_bytes,
-            "OP13.xlsx",
-            excel_bytes,
-        )
-
-    def test_import_saves_both_sources(self):
-        result = self.import_pair()
-        self.assertTrue(result["created"])
-
-        args = self.mocks["save"].call_args.args
-        self.assertIs(args[3][0], self.pdf_records)
-        self.assertIs(args[3][1], self.excel_records)
-
-    def test_descriptive_differences_are_preserved(self):
-        result = self.import_pair()
-
-        self.assertEqual(
-            {row["field"] for row in result["differences"]},
-            {"lift_model", "instrument_model"},
-        )
-
-    def test_measured_conflict_is_rejected(self):
-        change(self.excel_records, "reference_energy_wh", 240)
-
-        with self.assertRaisesRegex(ValueError, "reference_energy_wh"):
-            self.import_pair()
-
-        self.mocks["save"].assert_not_called()
-
-    def test_reported_energy_conflict_is_rejected(self):
-        change(self.excel_records, "annual_energy_kwh", 20000)
-
-        with self.assertRaisesRegex(ValueError, "annual_energy_kwh"):
-            self.import_pair()
-
-        self.mocks["save"].assert_not_called()
-
-    def test_test_date_conflict_is_rejected(self):
-        change(self.excel_records, "test_date", "2025-05-22")
-
-        with self.assertRaisesRegex(ValueError, "test_date"):
-            self.import_pair()
-
-        self.mocks["save"].assert_not_called()
-
-    def test_preview_rejection_blocks_save(self):
-        self.mocks["preview"].return_value = {
-            "review_status": "REVIEW_REQUIRED",
-            "conflicting_fields": ["idle_power_w"],
-            "missing_fields": [],
-        }
-
-        with self.assertRaisesRegex(ValueError, "idle_power_w"):
-            self.import_pair()
-
-        self.mocks["save"].assert_not_called()
-
-    def test_preview_id_mismatch_is_rejected(self):
-        self.mocks["preview"].return_value["elevator_id"] = "OP21"
-
-        with self.assertRaisesRegex(ValueError, "different elevators"):
-            self.import_pair()
-
-        self.mocks["save"].assert_not_called()
-
-    def test_wrong_case_rejected(self):
-        self.mocks["case"].return_value = (1, "OP21")
-
-        with self.assertRaisesRegex(ValueError, "Selected case"):
-            self.import_pair()
-
-        self.mocks["save"].assert_not_called()
-
-    def test_placeholder_case_allowed(self):
-        self.mocks["case"].return_value = (1, "TEST-LIFT-001")
-        self.assertTrue(self.import_pair()["created"])
-
-    def test_wrong_document_types_rejected(self):
-        invalid_pairs = (
-            (b"invalid", b"PK\x03\x04"),
-            (b"%PDF-1.7", b"invalid"),
-        )
-
-        for pdf_bytes, excel_bytes in invalid_pairs:
-            with self.assertRaisesRegex(ValueError, "Upload an EE PDF"):
-                self.import_pair(pdf_bytes, excel_bytes)
-
-        self.mocks["save"].assert_not_called()
-
-    def test_file_size_limit(self):
-        with patch("services.iso_import_service.MAX_FILE_BYTES", 8):
-            with self.assertRaisesRegex(ValueError, "15 MB"):
-                self.import_pair(pdf_bytes=b"%PDF-123456789")
-
-        self.mocks["save"].assert_not_called()
-
-    def test_duplicate_result(self):
-        self.mocks["save"].return_value = {
-            "assessment_id": 10,
-            "created": False,
-        }
-
-        self.assertFalse(self.import_pair()["created"])
-
-    def test_source_hashes(self):
-        self.import_pair()
-        files = self.mocks["save"].call_args.args[2]
-
-        self.assertEqual(
-            files[0]["sha256"],
-            hashlib.sha256(b"%PDF-1.7").hexdigest(),
-        )
-
-        self.assertEqual(
-            files[1]["sha256"],
-            hashlib.sha256(b"PK\x03\x04").hexdigest(),
-        )
-
-
-class TestIsoRepository(unittest.TestCase):
-    def test_different_lift_rejected_under_case_lock(self):
-        # Simulate a locked case containing a different lift.
-        pdf, excel = sample_records()
-
-        files = [
-            {
-                "type": "ee_pdf",
-                "sha256": "a" * 64,
-                "filename": "OP13.pdf",
-                "bytes": b"%PDF",
-            },
-            {
-                "type": "iso_excel",
-                "sha256": "b" * 64,
-                "filename": "OP13.xlsx",
-                "bytes": b"PK",
-            },
-        ]
-
-        with patch(
-            "services.iso_repository.get_connection"
-        ) as connection:
-            cursor = (
-                connection.return_value.__enter__.return_value
-                .cursor.return_value.__enter__.return_value
-            )
-
-            cursor.fetchone.side_effect = [
-                (1,),
-                (7, "OP21"),
-            ]
-
-            with self.assertRaisesRegex(
-                ValueError,
-                "already contains ISO data",
-            ):
-                save_iso_assessment(
-                    1,
-                    "OP13 (L)",
-                    files,
-                    (pdf, excel),
-                    [],
-                )
-
-            self.assertEqual(cursor.execute.call_count, 2)
-
+from contextlib import contextmanager
+from pathlib import Path
+from types import ModuleType
+from unittest.mock import MagicMock
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def override(modules):
+    original = {key: sys.modules.get(key) for key in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for key, value in original.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+
+
+def load(name, relative):
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+VALUES = [
+    {"field": "lift_id", "value": "OP13 (L)", "kind": "identity", "sheet": "Lift parameters", "cell": "C2"},
+    {"field": "rated_load_kg", "value": "1635", "kind": "specification", "unit": "kg", "sheet": "Lift parameters", "cell": "C5"},
+]
+
+
+class FakeCursor:
+    def __init__(self, answers=()):
+        self.answers = list(answers)
+        self.queries = []
+        self.bulk = []
+
+    def __enter__(self): return self
+    def __exit__(self, *_): return False
+    def execute(self, sql, values=()): self.queries.append((sql, values))
+    def executemany(self, sql, values): self.bulk.append((sql, values))
+    def fetchone(self): return self.answers.pop(0) if self.answers else None
+
+
+class FakeConnection:
+    def __init__(self, answers=()):
+        self.cursor_obj = FakeCursor(answers)
+        self.committed = False
+        self.rolled_back = False
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, *_):
+        self.committed = exc_type is None
+        self.rolled_back = exc_type is not None
+        return False
+    def cursor(self): return self.cursor_obj
+
+
+def load_repository(conn):
+    db = ModuleType("database")
+    db.get_connection = lambda: conn
+    with override({"database": db}):
+        return load("services.iso_repository", "services/iso_repository.py")
+
+
+def load_importer(extracted=None, case=(7, "OP13(L)"), saved=None):
+    extracted = VALUES if extracted is None else extracted
+    extract_module = ModuleType("services.iso_excel_extractor")
+    calls = []
+
+    def extract(raw):
+        calls.append(("extract", raw))
+        return extracted
+
+    extract_module.extract_iso_excel = extract
+    repo_module = ModuleType("services.iso_repository")
+    repo_module.normalise_lift_id = lambda val: "".join(c for c in str(val or "").upper() if c.isalnum())
+    repo_module.get_case_elevator = lambda ref: case
+
+    def store(**kwargs):
+        calls.append(("save", kwargs))
+        return {"assessment_id": 12, "created": True} if saved is None else saved(**kwargs)
+
+    repo_module.save_iso_excel_assessment = store
+    with override({"services.iso_excel_extractor": extract_module, "services.iso_repository": repo_module}):
+        importer = load("_isolated_iso_import", "services/iso_import_service.py")
+    return importer, calls
+
+
+class ISOImportTests(unittest.TestCase):
+    def test_valid_workbook_checks_case_and_stores_original(self):
+        importer, calls = load_importer()
+        data = b"PK\x03\x04demo"
+        saved = importer.process_iso_excel("MOD1007", "OP13.xlsx", data)
+        self.assertEqual(saved["lift_id"], "OP13 (L)")
+        self.assertEqual(saved["excel_fields"], 2)
+        self.assertEqual(calls[1][1]["checksum"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(calls[1][1]["file_bytes"], data)
+
+    def test_wrong_case_rejected_before_storage(self):
+        importer, calls = load_importer(case=(7, "OP21"))
+        with self.assertRaisesRegex(ValueError, "belongs to"):
+            importer.process_iso_excel("MOD1007", "OP13.xlsx", b"PK\x03\x04")
+        self.assertEqual(len(calls), 1)
+
+    def test_no_lift_id(self):
+        importer, calls = load_importer(extracted=[VALUES[1]])
+        with self.assertRaisesRegex(ValueError, "lift reference"):
+            importer.process_iso_excel("MOD1007", "OP13.xlsx", b"PK\x03\x04")
+        self.assertEqual(len(calls), 1)
+
+    def test_invalid_extension_rejected_without_extraction(self):
+        importer, calls = load_importer()
+        with self.assertRaisesRegex(ValueError, "valid ISO"):
+            importer.process_iso_excel("MOD1007", "OP13.pdf", b"PK\x03\x04")
+        self.assertFalse(calls)
+
+    def test_oversize_rejected(self):
+        importer, calls = load_importer()
+        with self.assertRaisesRegex(ValueError, "15 MB"):
+            importer.process_iso_excel("MOD1007", "OP13.xlsx", b"PK" + b"1" * (15 * 1024 * 1024))
+        self.assertFalse(calls)
+
+
+class ISORepositoryTests(unittest.TestCase):
+    checksum = "a" * 64
+
+    def test_first_excel_only_assessment_is_atomic(self):
+        conn = FakeConnection([(7,), None, None, (15,), (24,)])
+        repo = load_repository(conn)
+        saved = repo.save_iso_excel_assessment(7, "OP13 (L)", "OP13.xlsx", b"source", VALUES, self.checksum)
+        self.assertEqual(saved, {"assessment_id": 15, "created": True})
+        self.assertTrue(conn.committed)
+        queries = [sql for sql, _ in conn.cursor_obj.queries]
+        self.assertIn("FOR UPDATE", queries[0])
+        self.assertTrue(any("VALUES (%s, %s, NULL, %s)" in sql for sql in queries))
+        self.assertTrue(any("'iso_excel'" in sql for sql in queries))
+        self.assertEqual(len(conn.cursor_obj.bulk[0][1]), 2)
+        self.assertEqual({row[0] for row in conn.cursor_obj.bulk[0][1]}, {24})
+
+    def test_existing_case_excel_is_deduplicated(self):
+        conn = FakeConnection([(7,), (4, "OP13(L)"), (4,)])
+        repo = load_repository(conn)
+        result = repo.save_iso_excel_assessment(7, "OP13 (L)", "OP13.xlsx", b"source", VALUES, self.checksum)
+        self.assertEqual(result, {"assessment_id": 4, "created": False})
+        self.assertTrue(conn.committed)
+        self.assertFalse(any("INSERT INTO" in sql for sql, _ in conn.cursor_obj.queries))
+
+    def test_case_not_found_rolls_back(self):
+        conn = FakeConnection([None])
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "case not found"):
+            repo.save_iso_excel_assessment(7, "OP13", "OP13.xlsx", b"x", VALUES, self.checksum)
+        self.assertTrue(conn.rolled_back)
+
+    def test_historical_elevator_mismatch_rolls_back(self):
+        conn = FakeConnection([(7,), (2, "OP21")])
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "already contains ISO data"):
+            repo.save_iso_excel_assessment(7, "OP13", "OP13.xlsx", b"x", VALUES, self.checksum)
+        self.assertTrue(conn.rolled_back)
+
+    def test_duplicate_extracted_fields_rejected_before_connect(self):
+        conn = FakeConnection()
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "Duplicate or invalid"):
+            repo.save_iso_excel_assessment(7, "OP13", "OP13.xlsx", b"x", VALUES * 2, self.checksum)
+        self.assertEqual(conn.cursor_obj.queries, [])
+
+    def test_invalid_checksum_rejected_before_connect(self):
+        conn = FakeConnection()
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            repo.save_iso_excel_assessment(7, "OP13", "OP13.xlsx", b"x", VALUES, "bad")
+        self.assertFalse(conn.cursor_obj.queries)
+
+    def test_numeric_values_do_not_turn_text_into_zero(self):
+        repo = load_repository(FakeConnection())
+        self.assertIsNone(repo._number("not a number"))
+        self.assertIsNone(repo._number(False))
+        self.assertEqual(repo._number("1,635"), 1635)
+
+    def test_database_migration_is_additive(self):
+        sql = (ROOT / "database/migrations/012_iso_excel_only.sql").read_text()
+        self.assertIn("ALTER COLUMN pdf_sha256 DROP NOT NULL", sql)
+        self.assertIn("WHERE pdf_sha256 IS NULL", sql)
+        self.assertNotIn("DROP TABLE", sql.upper())
+
+
+
+
+class ISOApprovalTests(unittest.TestCase):
+    def test_approve_latest_pending_assessment(self):
+        conn = FakeConnection([(7,), (15, "pending"), (15,)])
+        repo = load_repository(conn)
+        self.assertEqual(repo.review_iso_assessment("MOD1007", 15, "approved", "Checked source"), "approved")
+        self.assertTrue(conn.committed)
+        sql, params = conn.cursor_obj.queries[-1]
+        self.assertIn("review_status = %s", sql)
+        self.assertIn("reviewed_at = NOW()", sql)
+        self.assertEqual(params, ("approved", "Checked source", 15, 7))
+        self.assertIn("FOR UPDATE", conn.cursor_obj.queries[0][0])
+
+    def test_reject_with_note(self):
+        conn = FakeConnection([(7,), (15, "pending"), (15,)])
+        repo = load_repository(conn)
+        self.assertEqual(repo.review_iso_assessment("MOD1007", 15, "rejected", "Bad formula"), "rejected")
+        self.assertEqual(conn.cursor_obj.queries[-1][1][0:2], ("rejected", "Bad formula"))
+
+    def test_rejection_requires_reason_before_db(self):
+        conn = FakeConnection()
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "reason"):
+            repo.review_iso_assessment("MOD1007", 15, "rejected")
+        self.assertFalse(conn.cursor_obj.queries)
+
+    def test_unknown_decision_rejected_before_db(self):
+        conn = FakeConnection()
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "decision"):
+            repo.review_iso_assessment("MOD1007", 15, "ready")
+        self.assertFalse(conn.cursor_obj.queries)
+
+    def test_stale_assessment_not_approved(self):
+        conn = FakeConnection([(7,), (16, "pending")])
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "latest"):
+            repo.review_iso_assessment("MOD1007", 15, "approved")
+        self.assertFalse(conn.committed)
+        self.assertFalse(any("UPDATE iso_assessments" in q for q, _ in conn.cursor_obj.queries))
+
+    def test_approved_cannot_be_approved_twice(self):
+        conn = FakeConnection([(7,), (15, "approved")])
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "pending"):
+            repo.review_iso_assessment("MOD1007", 15, "approved")
+        self.assertFalse(conn.committed)
+
+    def test_missing_case_rejected(self):
+        conn = FakeConnection([None])
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "case not found"):
+            repo.review_iso_assessment("MOD1007", 15, "approved")
+        self.assertFalse(conn.committed)
+
+    def test_no_iso_workbook_rejected(self):
+        conn = FakeConnection([(7,), None])
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "latest ISO"):
+            repo.review_iso_assessment("MOD1007", 15, "approved")
+        self.assertFalse(conn.committed)
+
+    def test_update_race_rolls_back(self):
+        conn = FakeConnection([(7,), (15, "pending"), None])
+        repo = load_repository(conn)
+        with self.assertRaisesRegex(ValueError, "modified"):
+            repo.review_iso_assessment("MOD1007", 15, "approved")
+        self.assertFalse(conn.committed)
+
+    def test_approval_migration_has_safe_defaults(self):
+        sql = (ROOT / "database/migrations/013_iso_excel_approval.sql").read_text()
+        self.assertIn("DEFAULT 'pending'", sql)
+        self.assertIn("reviewed_at TIMESTAMPTZ", sql)
+        self.assertIn("review_note TEXT", sql)
+        self.assertIn("review_status IN ('pending', 'approved', 'rejected')", sql)
+        self.assertNotIn("DROP TABLE", sql)
+        self.assertNotIn("TRUNCATE", sql)
 
 if __name__ == "__main__":
     unittest.main()

@@ -57,23 +57,23 @@ def build_navigation(role):
         pages["EnerCal"] = [
             st.Page(
                 "enercal/enercal_upload.py",
-                title="Upload Enercal report",
+                title="EnerCal Upload",
                 icon=":material/upload_file:",
                 default=True,
             ),
             st.Page(
                 "enercal/enercal_measurements.py",
-                title="Upload EE report and ISO excel",
+                title="ISO Excel Upload",
                 icon=":material/monitor_heart:",
             ),
             st.Page(
                 "enercal/enercal_review.py",
-                title="Cases infomation",
+                title="Case Workspace",
                 icon=":material/fact_check:",
             ),
             st.Page(
                 "enercal/enercal_reporting.py",
-                title="Approved Cases overview",
+                title="Approved Cases Overview",
                 icon=":material/monitoring:",
             ),
             st.Page(
