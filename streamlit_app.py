@@ -76,16 +76,6 @@ def build_navigation(role):
                 title="Approved Cases Overview",
                 icon=":material/monitoring:",
             ),
-            st.Page(
-                "enercal/enercal_ai_training.py",
-                title="AI training & evaluation",
-                icon=":material/model_training:",
-            ),
-            st.Page(
-                "enercal/enercal_ai_prediction.py",
-                title="AI prediction",
-                icon=":material/online_prediction:",
-            ),
         ]
 
     pages["Account"] = [
