@@ -1,0 +1,23 @@
+name: Temporary non-AI regression tests
+on:
+  push:
+    branches: [ci-test-only-2026-11-23]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+      - name: Install project environment
+        run: uv sync --frozen
+      - name: Check Python syntax
+        run: uv run python -m compileall -q streamlit_app.py enercal services scripts
+      - name: Run remaining unit tests
+        run: uv run python -m unittest discover -s tests -p 'test_*.py'
+      - name: Run live-workflow self-tests
+        run: uv run python -m scripts.check_fyp_live_workflow --self-test
