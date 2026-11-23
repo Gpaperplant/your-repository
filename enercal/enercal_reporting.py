@@ -442,7 +442,7 @@ def main():
         st.error("Admin access is required")
         st.stop()
 
-    st.subheader("Modernisation | Sustainability KPI Overview")
+    st.subheader("Modernisation Cases Overview")
     try:
         statuses, reports, iso_reports = (
             load_case_statuses(), load_reports(), load_iso_reports()

@@ -1,7 +1,8 @@
+
 """Read-only live integration check for the KONE modernisation FYP.
 
 Checks registered cases, EnerCal approval coverage, verified meter pairs,
-and AI training readiness. No changes to PostgreSQL and no model training.
+and metered energy review status. No changes to PostgreSQL.
 
 Run from the repository root:
     uv run python -m scripts.check_fyp_live_workflow --self-test
@@ -19,7 +20,6 @@ REQUIRED_RELATIONS = (
     "public.extraction_revisions",
     "public.enercal_approved_kpis_view",
     "public.verified_measurement_pairs",
-    "public.ai_verified_measurement_pairs_view",
     "public.energy_observations",
     "public.measurement_sources",
 )
@@ -53,11 +53,6 @@ GROUP BY p.review_status
 ORDER BY p.review_status
 """
 
-ELIGIBLE_PAIRS_QUERY = """
-SELECT COUNT(*) AS pair_count, COUNT(DISTINCT elevator_id) AS elevator_count
-FROM ai_verified_measurement_pairs_view
-"""
-
 
 def analyse_cases(rows):
     """Summarise states; keep no-PDF cases as valid records."""
@@ -89,10 +84,6 @@ def validate_approved_roles(rows):
                 "expected one existing and one proposed row."
             )
     return len(grouped) - len(problems), problems
-
-
-def training_ready(elevator_count, minimum):
-    return elevator_count >= minimum
 
 
 def _fetch_dicts(cur, sql, parameters=None):
@@ -131,7 +122,6 @@ def read_db_snapshot():
         cases = _fetch_dicts(cur, CASE_QUERY)
         approved = _fetch_dicts(cur, APPROVED_ROLES_QUERY)
         pair_statuses = _fetch_dicts(cur, PAIRS_QUERY)
-        eligible = _fetch_dicts(cur, ELIGIBLE_PAIRS_QUERY)[0]
 
     return {
         "database": database_name,
@@ -141,10 +131,9 @@ def read_db_snapshot():
             for row in approved
         ],
         "pair_statuses": {
-            str(row["review_status"]): row["pair_count"] for row in pair_statuses
+            str(row["review_status"]): row["pair_count"]
+            for row in pair_statuses
         },
-        "eligible_pair_count": eligible["pair_count"],
-        "eligible_elevator_count": eligible["elevator_count"],
     }
 
 
@@ -184,11 +173,8 @@ def run_live():
         print("  None stored")
     for status, count in sorted(snapshot["pair_statuses"].items()):
         print(f"  {status}: {count}")
-    print(f"Eligible independently verified meter pairs: {snapshot['eligible_pair_count']}")
-    print(f"Distinct eligible elevators (pair view): {snapshot['eligible_elevator_count']}")
 
-    # Exercise the same real data loaders used by the reporting and AI pages.
-    # Do not start training; data readiness and absence of measurements are valid.
+    # Exercise the verified-savings reporting service without modifying data.
     try:
         from services.verified_savings_reporting import load_verified_savings
         measured_rows = load_verified_savings()
@@ -196,22 +182,6 @@ def run_live():
     except Exception as exc:
         print(f"FAIL: Measured-vs-estimated integration failed: {exc}")
         problems.append("Measured-vs-estimated service error")
-
-    try:
-        from services.ai_measurement_loader import prepare_ai_dataset
-        from services.ai_training import MIN_ELEVATORS
-        dataset, excluded = prepare_ai_dataset()
-        distinct = len({row["elevator_id"] for row in dataset})
-        print(f"AI-ready projects: {len(dataset)}")
-        print(f"AI excluded records: {len(excluded)}")
-        print(f"AI-ready distinct elevators: {distinct} / {MIN_ELEVATORS}")
-        if training_ready(distinct, MIN_ELEVATORS):
-            print("AI readiness: minimum data count met (not a model-validation result)")
-        else:
-            print("AI readiness: NOT READY (expected when evidence is insufficient)")
-    except Exception as exc:
-        print(f"FAIL: AI dataset integration failed: {exc}")
-        problems.append("AI dataset integration error")
 
     if problems:
         print(f"FAIL: {len(problems)} integration issue(s). No data was changed.")
@@ -271,11 +241,6 @@ class _SelfTests(unittest.TestCase):
         ])
         self.assertEqual(complete, 0)
         self.assertEqual(len(issues), 1)
-
-    def test_ai_readiness_threshold(self):
-        self.assertFalse(training_ready(0, 10))
-        self.assertFalse(training_ready(9, 10))
-        self.assertTrue(training_ready(10, 10))
 
 
 def main():
