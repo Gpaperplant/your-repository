@@ -1,4 +1,3 @@
-
 """Entry point for the KONE modernisation workspace."""
 
 import streamlit as st
@@ -76,6 +75,16 @@ def build_navigation(role):
                 "enercal/enercal_reporting.py",
                 title="Approved Cases Overview",
                 icon=":material/monitoring:",
+            ),
+            st.Page(
+                "enercal/enercal_ai_prediction.py",
+                title="AI Savings Prediction",
+                icon=":material/online_prediction:",
+            ),
+            st.Page(
+                "enercal/enercal_ai_training.py",
+                title="AI Model Training",
+                icon=":material/model_training:",
             ),
         ]
 

@@ -1,5 +1,4 @@
-
-"""Register modernisation cases and upload the supported 12 page MOD reports."""
+"""Register cases and upload 12-page MOD reports into unified evidence storage."""
 
 import hashlib
 import re
@@ -35,7 +34,6 @@ def load_options():
             elevator_id: f"{reference}    {building or ''}".strip()
             for elevator_id, reference, building in cur.fetchall()
         }
-
     return cases, elevators
 
 
@@ -53,31 +51,32 @@ def create_case(case_ref, elevator_id):
 
 
 def find_existing_document(case_ref, pdf_bytes):
+    """Check the new evidence store, never the legacy MOD document table."""
+    if not isinstance(pdf_bytes, bytes):
+        raise ValueError("PDF must be provided as bytes.")
     checksum = hashlib.sha256(pdf_bytes).hexdigest()
-
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT d.document_id
-            FROM source_documents d
+            FROM project_documents d
             JOIN modernisation_cases m ON m.case_id = d.case_id
-            WHERE m.case_ref = %s AND d.file_sha256 = %s
+            WHERE m.case_ref = %s
+              AND d.document_type = 'mod_pdf'
+              AND d.file_sha256 = %s
             """,
             (case_ref, checksum),
         )
         row = cur.fetchone()
-
     return row[0] if row else None
 
 
 def format_value(value):
     if value is None:
         return "N/A"
-
     if isinstance(value, (Decimal, int, float)):
         number = format(Decimal(str(value)), ",f")
         return number.rstrip("0").rstrip(".") if "." in number else number
-
     return str(value)
 
 
@@ -116,17 +115,13 @@ if st.session_state.get("role") != "Admin":
     st.error("Admin access is required")
     st.stop()
 
-
 st.subheader("EnerCal upload")
-st.caption(
-    "Register a case and upload a 12 page MOD report for engineering review"
-)
+st.caption("Register a case and upload a 12 page MOD report for engineering review")
+st.caption("Original PDF, revision and engineering values are saved in unified evidence storage.")
 
 message = st.session_state.pop("enercal_case_created", None)
-
 if message:
     st.write(f":green[{message}]")
-
 
 try:
     cases, elevators = load_options()
@@ -134,149 +129,96 @@ except Exception as error:
     st.error(f"Could not load cases and elevators {error}")
     st.stop()
 
-
 with st.expander("Register a new case", expanded=not bool(cases)):
     if not elevators:
         st.write("Register an elevator before creating a case")
 
     with st.form("enercal_create_case", clear_on_submit=True):
-        new_ref = st.text_input(
-            "Case reference",
-            placeholder="MOD1001",
-        )
-
+        new_ref = st.text_input("Case reference", placeholder="MOD1001")
         elevator_id = st.selectbox(
-            "Select elevator",
-            list(elevators),
+            "Select elevator", list(elevators),
             format_func=lambda key: elevators[key],
             disabled=not bool(elevators),
         )
-
         create_submitted = st.form_submit_button(
-            "Create case",
-            type="primary",
-            disabled=not bool(elevators),
+            "Create case", type="primary", disabled=not bool(elevators),
         )
 
     if create_submitted:
         clean_ref = new_ref.strip().upper()
-
         if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{2,39}", clean_ref):
-            st.error(
-                "Use 3 to 40 letters numbers underscores or hyphens"
-            )
-
+            st.error("Use 3 to 40 letters numbers underscores or hyphens")
         elif clean_ref in cases:
             st.warning("This case already exists")
-
         else:
             try:
                 create_case(clean_ref, elevator_id)
-
             except UniqueViolation:
                 st.warning("This case already exists")
-
             except Exception as error:
                 st.error(f"Could not create case {error}")
-
             else:
                 st.session_state["enercal_upload_selected_case"] = clean_ref
-                st.session_state["enercal_case_created"] = (
-                    f"Case {clean_ref} created"
-                )
+                st.session_state["enercal_case_created"] = f"Case {clean_ref} created"
                 st.rerun()
-
 
 st.divider()
 st.subheader("Upload report")
-
 if not cases:
     st.write("Create a modernisation case to continue")
     st.stop()
 
-
 case_ref = st.selectbox(
-    "Choose a case",
-    cases,
-    key="enercal_upload_selected_case",
+    "Choose a case", cases, key="enercal_upload_selected_case",
 )
-
 uploaded = st.file_uploader(
-    "Choose a MOD PDF",
-    type="pdf",
-    key=f"enercal_pdf_{case_ref}",
+    "Choose a MOD PDF", type="pdf", key=f"enercal_pdf_{case_ref}",
 )
-
 if uploaded is None:
     st.write("Choose a PDF to preview its energy comparison")
     st.stop()
 
-
 pdf_bytes = uploaded.getvalue()
-
 if not pdf_bytes.startswith(b"%PDF-") or len(pdf_bytes) > MAX_PDF_SIZE:
     st.error("Choose a valid PDF no larger than 15 MB")
     st.stop()
-
 
 try:
     existing_id = find_existing_document(case_ref, pdf_bytes)
 except Exception as error:
     st.error(f"Could not check existing reports {error}")
     st.stop()
-
-
 if existing_id is not None:
-    st.write(
-        f"This report is already saved as document {existing_id}"
-    )
+    st.write(f"This report is already saved as unified document {existing_id}")
     st.stop()
-
 
 try:
     with st.spinner("Reading MOD report"):
         extracted = extract_report(pdf_bytes)
-
 except Exception as error:
     st.error(f"Could not read the MOD report {error}")
     st.stop()
 
-
 comparison = extracted["comparison"]
 specifications = extracted["specifications"]
 
-
 st.subheader("Report preview")
-
 left, right = st.columns(2)
-
 left.metric(
     "Reported energy saving",
     f'{format_value(comparison["reported_energy_saving_percent"])}%',
 )
-
 right.metric(
     "Calculated energy saving",
     f'{format_value(comparison["calculated_energy_saving_percent"])}%',
 )
-
-
-st.dataframe(
-    comparison_rows(comparison),
-    hide_index=True,
-    width="stretch",
-)
-
+st.dataframe(comparison_rows(comparison), hide_index=True, width="stretch")
 st.caption(
     f'Comparison from page {comparison["source_page"]}    '
     f'Lifetime {comparison["lifetime_years"]} years    '
     f'{len(specifications)} additional fields'
 )
-
-st.caption(
-    "Results are estimates and require engineering approval"
-)
-
+st.caption("Results are estimates and require engineering approval")
 
 with st.expander("Additional extracted information"):
     st.dataframe(
@@ -289,11 +231,8 @@ with st.expander("Additional extracted information"):
             }
             for key, value, unit, page in specifications
         ],
-        hide_index=True,
-        width="stretch",
-        height=320,
+        hide_index=True, width="stretch", height=320,
     )
-
 
 if st.button("Save report", type="primary"):
     try:
@@ -303,17 +242,13 @@ if st.button("Save report", type="primary"):
             pdf_bytes=pdf_bytes,
             extracted=extracted,
         )
-
     except Exception as error:
         st.error(f"Could not save report {error}")
-
     else:
-        st.write(
-            f':green[Report {result["document_id"]} saved with '
-            f'{result["fields_saved"]} comparison fields and '
-            f'{result["additional_fields_saved"]} additional fields]'
+        st.success(
+            f'Unified document {result["document_id"]}, revision '
+            f'{result["revision_no"]} saved with '
+            f'{result["values_saved"]} engineering values '
+            f'({result["comparison_fields_saved"]} comparison fields).'
         )
-
-        st.write(
-            "Open Case Workspace to review and approve the extracted data"
-        )
+        st.write("Open Case Workspace to review the extracted values")

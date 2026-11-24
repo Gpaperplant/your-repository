@@ -1,14 +1,13 @@
-"""Offline regression tests for saved ISO Excel evidence in Case workspace."""
+"""Regression tests for ISO evidence in the unified five-table Case Workspace."""
 
 import importlib.util
 import sys
-import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
-import pandas as pd  # Import compiled dependencies before temporary module overrides.
-
+import pandas as pd  # Load compiled packages before replacing Streamlit.
+import pytest
 
 PAGE = Path(__file__).resolve().parents[1] / "enercal" / "enercal_review.py"
 
@@ -19,44 +18,40 @@ class Stopped(Exception):
 
 @contextmanager
 def override_modules(replacements):
-    old = {key: sys.modules.get(key) for key in replacements}
+    previous = {name: sys.modules.get(name) for name in replacements}
     try:
         sys.modules.update(replacements)
         yield
     finally:
-        for key, prior in old.items():
-            if prior is None:
-                sys.modules.pop(key, None)
+        for name, original in previous.items():
+            if original is None:
+                sys.modules.pop(name, None)
             else:
-                sys.modules[key] = prior
+                sys.modules[name] = original
 
 
 class FakeStreamlit(ModuleType):
-    def __init__(self, role="Admin", selected_filter="ISO Excel"):
+    def __init__(self, role="Admin", decision="Choose decision", submit=False,
+                 checked=False, note="", revision_selection=None):
         super().__init__("streamlit")
         self.session_state = {"role": role}
-        self.selected_filter = selected_filter
+        self.decision = decision
+        self.submit = submit
+        self.checked = checked
+        self.note = note
+        self.revision_selection = revision_selection
         self.messages = []
-        self.downloads = []
         self.tables = []
-        self.tabs_seen = []
+        self.downloads = []
         self.metrics = []
-        self.column_config = SimpleNamespace(
-            TextColumn=lambda *a, **k: None,
-            NumberColumn=lambda *a, **k: None,
-        )
-        self.cache_data = lambda *a, **k: (lambda func: func)
-        self.iso_decision = "Choose decision"
-        self.iso_submit = False
-        self.iso_note = ""
-        self.iso_selection = None
-        self.review_calls = []
-        self.radio_choices = []
+        self.tabs_seen = []
+        self.controls = []
+        self.cache_data = lambda *args, **kwargs: (lambda function: function)
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *_):
         return False
 
     def stop(self):
@@ -65,341 +60,305 @@ class FakeStreamlit(ModuleType):
     def rerun(self):
         raise Stopped()
 
-    def error(self, message):
-        self.messages.append(("error", str(message)))
+    def _message(self, category, text):
+        self.messages.append((category, str(text)))
 
-    def info(self, message):
-        self.messages.append(("info", str(message)))
+    def error(self, text):
+        self._message("error", text)
 
-    def warning(self, message):
-        self.messages.append(("warning", str(message)))
+    def info(self, text):
+        self._message("info", text)
 
-    def success(self, message):
-        self.messages.append(("success", str(message)))
+    def warning(self, text):
+        self._message("warning", text)
 
-    def caption(self, message):
-        self.messages.append(("caption", str(message)))
+    def success(self, text):
+        self._message("success", text)
 
-    def subheader(self, message):
-        self.messages.append(("subheader", str(message)))
+    def caption(self, text):
+        self._message("caption", text)
+
+    def subheader(self, text):
+        self._message("subheader", text)
 
     def write(self, *args, **kwargs):
-        self.messages.append(("write", " ".join(map(str, args))))
+        self._message("write", " ".join(str(x) for x in args))
 
-    def markdown(self, *args, **kwargs):
-        pass
+    def metric(self, label, value, **kwargs):
+        self.metrics.append((label, value))
 
-    def bar_chart(self, *args, **kwargs):
-        pass
-
-    def divider(self, *args, **kwargs):
-        pass
-
-    def metric(self, name, value, **kwargs):
-        self.metrics.append((name, value))
-
-    def columns(self, sizes, **kwargs):
-        return [self] * (sizes if isinstance(sizes, int) else len(sizes))
-
-    def container(self, **kwargs):
-        return self
-
-    def expander(self, *args, **kwargs):
-        return self
-
-    def form(self, *args, **kwargs):
-        return self
-
-    def radio(self, label, choices, **kwargs):
-        self.radio_choices.append((label, list(choices)))
-        return choices[0]
-
-    def text_input(self, *args, **kwargs):
-        return self.iso_note
-
-    def form_submit_button(self, *args, **kwargs):
-        return False
-
-    def tabs(self, titles):
-        self.tabs_seen.append(titles)
-        return [self] * len(titles)
-
-    def selectbox(self, label, options, **kwargs):
-        if label == "ISO review decision":
-            return self.iso_decision
-        if label == "Saved assessment" and self.iso_selection is not None:
-            return self.iso_selection
-        if label == "Show evidence":
-            return self.selected_filter
-        return list(options)[0]
-
-    def button(self, label, **kwargs):
-        return self.iso_submit if label == "Submit ISO review" else False
-
-    def checkbox(self, *args, **kwargs):
-        return False
-
-    def download_button(self, label, data, file_name, mime, **kwargs):
-        self.downloads.append({"label": label, "data": data, "filename": file_name, "mime": mime})
+    def columns(self, spec, **kwargs):
+        count = spec if isinstance(spec, int) else len(spec)
+        return [self] * count
 
     def dataframe(self, data, **kwargs):
         self.tables.append(data)
 
+    def tabs(self, labels):
+        self.tabs_seen.append(list(labels))
+        return [self] * len(labels)
 
-class FakeCursor:
-    def __init__(self, cases, docs, values, fail=False):
-        self.cases = cases
-        self.docs = docs
-        self.values = values
-        self.fail = fail
-        self.requests = []
-        self.description = []
-        self.rows = []
+    def selectbox(self, label, options, **kwargs):
+        self.controls.append((label, list(options)))
+        if label == "Decision":
+            return self.decision
+        if label == "Revision" and self.revision_selection is not None:
+            return self.revision_selection
+        return list(options)[0]
 
-    def __enter__(self):
+    def form(self, *args, **kwargs):
         return self
 
-    def __exit__(self, *args):
-        return False
+    def form_submit_button(self, label, **kwargs):
+        self.controls.append(("form_submit_button", label))
+        return self.submit
 
-    def execute(self, query, params=()):
-        self.requests.append((query, params))
-        if self.fail:
+    def text_area(self, *args, **kwargs):
+        return self.note
+
+    def checkbox(self, label, **kwargs):
+        return self.checked if label == "I checked the comparison against the original source" else False
+
+    def download_button(self, label, data, file_name, mime, **kwargs):
+        self.downloads.append({"label": label, "data": data, "filename": file_name, "mime": mime})
+
+
+ISO_DOCUMENT = {
+    "document_id": 5,
+    "case_id": 8,
+    "case_ref": "TEST-MOD-REV-001",
+    "document_type": "iso_excel",
+    "source_classification": "test_fixture",
+    "filename": "OP13.xlsx",
+}
+
+
+def _revision(revision_id=40, revision_no=1, status="pending", scope="comparison_only"):
+    return {
+        "revision_id": revision_id,
+        "document_id": 5,
+        "revision_no": revision_no,
+        "review_scope": scope,
+        "review_status": status,
+        "document_type": "iso_excel",
+        "source_classification": "test_fixture",
+        "filename": "OP13.xlsx",
+        "case_ref": "TEST-MOD-REV-001",
+        "value_count": 1,
+        "verified_count": 0,
+        "corrected_count": 0,
+        "review_event_count": 1,
+        "created_at": "2026-11-24",
+    }
+
+
+def _value():
+    return {
+        "phase": "existing",
+        "field_name": "rated_load_kg",
+        "numeric_value": 1635,
+        "text_value": None,
+        "raw_source_value": "1635",
+        "unit": "kg",
+        "source_page": None,
+        "excel_sheet": "Lift parameters",
+        "excel_cell": "C5",
+        "excel_formula": "=1000+635",
+        "source_verified": False,
+        "is_corrected": False,
+        "correction_reason": None,
+    }
+
+
+def render(*, role="Admin", status="pending", decision="Choose decision", submit=False,
+           checked=False, note="", revisions=None, revision_selection=None,
+           documents=None, values=None, file_error=False, load_error=False):
+    ui = FakeStreamlit(role, decision, submit, checked, note, revision_selection)
+    revisions = revisions if revisions is not None else [_revision(status=status)]
+    documents = documents if documents is not None else [dict(ISO_DOCUMENT)]
+    values = values if values is not None else [_value()]
+    calls = {"cases": 0, "documents": 0, "snapshot": [], "reviews": [], "files": []}
+
+    workspace = ModuleType("services.unified_case_workspace_repository")
+
+    def list_cases():
+        calls["cases"] += 1
+        if load_error:
             raise RuntimeError("Database unavailable")
-        normalized = " ".join(query.lower().split())
-        if "from iso_assessments a" in normalized and "join iso_documents" not in normalized:
-            rows = self.cases if params == ("MOD1007",) else []
-        elif "from iso_documents d" in normalized:
-            rows = self.docs if params == (2, "MOD1007") else []
-        elif "from iso_extracted_values v" in normalized:
-            rows = self.values if params == (2, "MOD1007") else []
-        else:
-            raise AssertionError("Unexpected SQL in ISO evidence tab")
-        self.description = [SimpleNamespace(name=key) for key in rows[0]] if rows else []
-        self.rows = [tuple(row.values()) for row in rows]
+        return [{"case_ref": "TEST-MOD-REV-001"}] if documents else []
 
-    def fetchall(self):
-        return list(self.rows)
+    def list_documents(case_ref):
+        calls["documents"] += 1
+        assert case_ref == "TEST-MOD-REV-001"
+        return documents
 
+    def list_revisions(document_id):
+        assert document_id == 5
+        return revisions
 
-class FakeConnection:
-    def __init__(self, cursor):
-        self.cur = cursor
+    def get_snapshot(revision_id):
+        calls["snapshot"].append(revision_id)
+        selected = next(r for r in revisions if r["revision_id"] == revision_id)
+        return {"revision": dict(selected), "values": values, "reviews": [{
+            "action": "revision_submitted",
+            "previous_status": None,
+            "new_status": "pending",
+            "reason": "Uploaded",
+            "created_at": "2026-11-24",
+        }]}
 
-    def __enter__(self):
-        return self
+    def get_file(document_id):
+        calls["files"].append(document_id)
+        if file_error:
+            raise RuntimeError("File not available")
+        return {
+            "file_content": b"PK\x03\x04 source",
+            "filename": "OP13.xlsx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
 
-    def __exit__(self, *args):
-        return False
+    workspace.list_workspace_cases = list_cases
+    workspace.list_case_documents = list_documents
+    workspace.list_document_revisions = list_revisions
+    workspace.get_revision_snapshot = get_snapshot
+    workspace.get_document_file = get_file
+    workspace.mod_comparison_from_snapshot = lambda _: (_ for _ in ()).throw(AssertionError("MOD logic should not run for ISO"))
 
-    def cursor(self):
-        return self.cur
+    actions = ModuleType("services.unified_review_actions")
+    actions.CALCULATED_FIELD = "calculated_energy_saving_percent"
+    actions.FIELD_LABELS = {}
 
+    def submit_review(document_id, status, reason):
+        calls["reviews"].append((document_id, status, reason))
+        return {"revision_no": 2}
 
-def fake_candidates():
-    pairs = [
-        ("elevator_technology", None, "Old", "New"),
-        ("annual_energy_consumption", "kWh/year", "10000", "5500"),
-        ("annual_regenerative_energy", "kWh/year", "100", "200"),
-        ("annual_electricity_expenditure", "$/year", "2000", "1100"),
-        ("lifetime_electricity_expenditure", "$", "50000", "27500"),
-        ("operational_co2e", "kg CO2e", "30000", "17000"),
-        ("embodied_co2e", "kg CO2e", "4000", "5000"),
-    ]
-    result = {}
-    for field, unit, before, after in pairs:
-        for role, value in (("existing", before), ("proposed", after)):
-            numeric = float(value) if field != "elevator_technology" else None
-            result[f"{role}_{field}"] = {"numeric_value": numeric, "raw_value": value, "unit": unit}
-    result["reported_energy_saving_percent"] = {"numeric_value": 45.0, "raw_value": "45", "unit": "%"}
-    result["calculated_energy_saving_percent"] = {"numeric_value": 45.0, "raw_value": "45", "unit": "%"}
-    return result
+    actions.submit_comparison_review = submit_review
+    actions.submit_mod_correction = lambda *args: (_ for _ in ()).throw(AssertionError("ISO cannot use MOD correction"))
 
-
-def sample_data():
-    cases = [{"assessment_id": 2, "lift_id": "OP13 (L)", "imported_at": "2026-11-17", "review_status": "pending", "reviewed_at": None, "review_note": ""}]
-    docs = [{"document_id": 12, "filename": "OP13.xlsx", "content": memoryview(b"PK\x03\x04 original")}]
-    values = [
-        {"field_name": "rated_load_kg", "value_text": "1635", "unit": "kg",
-         "excel_sheet": "Lift parameters", "excel_cell": "C5"},
-    ]
-    return cases, docs, values
-
-
-def render(role="Admin", selected_filter="ISO Excel", cases=None, docs=None, values=None,
-           fail=False, status="approved", decision=None, note="", submit=False, selected_iso=None):
-    base_cases, base_docs, base_values = sample_data()
-    cursor = FakeCursor(base_cases if cases is None else cases, base_docs if docs is None else docs, base_values if values is None else values, fail=fail)
-    ui = FakeStreamlit(role, selected_filter)
-    ui.iso_decision = decision or "Choose decision"
-    ui.iso_note = note
-    ui.iso_submit = submit
-    ui.iso_selection = selected_iso
-    db = ModuleType("database")
-    db.get_connection = lambda: FakeConnection(cursor)
-    repo = ModuleType("services.enercal_review_repository")
-    candidates = fake_candidates()
-    repo.CALCULATED_FIELD = "calculated_energy_saving_percent"
-    repo.EDITABLE_STATUSES = {"pending", "changes_requested", "further_verification_required"}
-    repo.EXPECTED_FIELDS = set(candidates)
-    repo.FIELD_LABELS = {key: key for key in candidates}
-    repo.get_review_documents = lambda: [(63, "MOD1007")]
-    repo.get_review_details = lambda _: {
-        "candidates": [{"field_name": key, **value} for key, value in candidates.items()],
-        "revision_no": 2, "status": status, "pdf_bytes": b"original report", "filename": "Enercal_MOD1007.pdf",
-        "history": [], "events": [],
-    }
-    repo.get_specifications = lambda _: []
-    repo.resubmit_revision = lambda *args: None
-    repo.review_revision = lambda *args: None
-    repo.submit_verification = lambda *args: None
-    iso_repo = ModuleType("services.iso_repository")
-    def review_iso(*args):
-        ui.review_calls.append(args)
-        return args[2]
-
-    iso_repo.review_iso_assessment = review_iso
-    mapping = {
-        "services.iso_repository": iso_repo,
+    replacement = {
         "streamlit": ui,
-        "database": db,
-        "services.enercal_review_repository": repo,
+        "services.unified_case_workspace_repository": workspace,
+        "services.unified_review_actions": actions,
     }
-    with override_modules(mapping):
-        spec = importlib.util.spec_from_file_location("test_isolated_review_page", PAGE)
-        page = importlib.util.module_from_spec(spec)
+    with override_modules(replacement):
+        spec = importlib.util.spec_from_file_location("_unified_iso_test_page", PAGE)
+        module = importlib.util.module_from_spec(spec)
         try:
-            spec.loader.exec_module(page)
+            spec.loader.exec_module(module)
         except Stopped:
             pass
-    return page, ui, cursor
+    return ui, calls
 
 
-class TestSavedIsoTab(unittest.TestCase):
-    def test_pending_review_still_shows_iso_tab(self):
-        _, ui, _ = render(status="pending")
-        self.assertEqual(ui.tabs_seen[0][2], "ISO Excel data")
-        self.assertEqual(len(ui.downloads), 2)
-
-    def test_tabs_and_report_remain(self):
-        _, ui, _ = render()
-        self.assertEqual(ui.tabs_seen[0], ["Overview", "PDF and data", "ISO Excel data", "History"])
-        self.assertTrue(any(m == "EnerCal review" for t, m in ui.messages if t == "subheader"))
-
-    def test_pdf_review_only_approve_and_correct_values(self):
-        _, ui, _ = render(status="pending")
-        self.assertIn(
-            ("Choose a review action", ["Approve", "Correct values"]),
-            ui.radio_choices,
-        )
-        self.assertFalse(
-            any("Other decision" in choices for _, choices in ui.radio_choices)
-        )
-
-    def test_pdf_existing_change_request_still_supports_correction(self):
-        _, ui, _ = render(status="changes_requested")
-        self.assertIn(
-            ("Choose a review action", ["Confirm unchanged", "Correct values"]),
-            ui.radio_choices,
-        )
-
-    def test_saved_excel_download(self):
-        _, ui, _ = render()
-        self.assertEqual(len(ui.downloads), 2)
-        excel = next(item for item in ui.downloads if item["label"] == "Download ISO Excel")
-        self.assertEqual(excel["data"], b"PK\x03\x04 original")
-        self.assertEqual(excel["filename"], "OP13.xlsx")
-
-    def test_saved_values_and_no_pdf_columns(self):
-        _, ui, _ = render()
-        rows = next(t for t in ui.tables if t and t[0].get("Field") == "rated_load_kg")
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["Excel cell"], "C5")
-        self.assertEqual(set(rows[0]), {"Field", "Value", "Unit", "Excel sheet", "Excel cell"})
-        self.assertIn(("ISO Excel fields", 1), ui.metrics)
-
-    def test_iso_display_values_are_text_for_arrow(self):
-        _, ui, _ = render(values=[
-            {"field_name": "rated_load_kg", "value_text": 1635, "unit": "kg",
-             "excel_sheet": "Lift parameters", "excel_cell": "C5"},
-            {"field_name": "source_note", "value_text": "Updated model", "unit": None,
-             "excel_sheet": "Test parameters", "excel_cell": "C3"},
-            {"field_name": "unknown", "value_text": None, "unit": None,
-             "excel_sheet": "Calculation", "excel_cell": "C20"},
-        ])
-        rows = next(table for table in ui.tables if table and table[0].get("Field") == "rated_load_kg")
-        self.assertEqual([row["Value"] for row in rows], ["1635", "Updated model", ""])
-        self.assertTrue(all(isinstance(row["Value"], str) for row in rows))
-
-    def test_enercal_specification_values_are_text_for_arrow(self):
-        page, ui, _ = render()
-        page.show_specifications([
-            {"Field": "Company", "Value": "KONE", "Unit": "", "Source page": 2},
-            {"Field": "Rated load", "Value": 1635, "Unit": "kg", "Source page": 2},
-            {"Field": "Energy", "Value": 22084.07, "Unit": "kWh", "Source page": 2},
-            {"Field": "Missing", "Value": None, "Unit": "", "Source page": 2},
-        ], 63)
-        rows = next(table for table in ui.tables if table and table[0].get("Field") == "Company")
-        self.assertEqual([row["Value"] for row in rows], ["KONE", "1635", "22084.07", ""])
-        self.assertTrue(all(isinstance(row["Value"], str) for row in rows))
-
-    def test_case_and_assessment_scope(self):
-        _, _, cursor = render()
-        self.assertEqual(len(cursor.requests), 3)
-        self.assertEqual(cursor.requests[0][1], ("MOD1007",))
-        self.assertEqual(cursor.requests[1][1], (2, "MOD1007"))
-        self.assertEqual(cursor.requests[2][1], (2, "MOD1007"))
-        self.assertTrue(all("modernisation_cases m" in q for q, _ in cursor.requests))
-        self.assertTrue(all(q.strip().upper().startswith("SELECT") for q, _ in cursor.requests))
-        self.assertTrue(all("iso_excel" in q for q, _ in cursor.requests))
-
-    def test_pending_iso_has_review_control(self):
-        _, ui, _ = render()
-        self.assertTrue(any("ISO engineering review" == msg for kind, msg in ui.messages if kind == "subheader"))
-        self.assertTrue(any("Pending review" in msg for kind, msg in ui.messages if kind == "write"))
-
-    def test_approved_iso_cannot_be_approved_again(self):
-        cases, _, _ = sample_data()
-        cases[0]["review_status"] = "approved"
-        _, ui, _ = render(cases=cases)
-        self.assertFalse(any("ISO engineering review" == msg for kind, msg in ui.messages if kind == "subheader"))
-        self.assertTrue(any("Approved" in msg for kind, msg in ui.messages if kind == "write"))
-
-    def test_old_iso_assessment_read_only(self):
-        cases, _, _ = sample_data()
-        older = {**cases[0], "assessment_id": 1}
-        _, ui, _ = render(cases=[cases[0], older], selected_iso=1)
-        self.assertTrue(any("An older ISO" in msg for kind, msg in ui.messages if kind == "caption"))
-        self.assertFalse(ui.review_calls)
-
-    def test_iso_approve_click_calls_repository(self):
-        _, ui, _ = render(decision="Approve", note="Reviewed workbook", submit=True)
-        self.assertEqual(ui.review_calls, [("MOD1007", 2, "approved", "Reviewed workbook")])
-
-    def test_iso_reject_click_passes_reason(self):
-        _, ui, _ = render(decision="Reject", note="Invalid calculation", submit=True)
-        self.assertEqual(ui.review_calls, [("MOD1007", 2, "rejected", "Invalid calculation")])
-
-    def test_no_assessments(self):
-        _, ui, cursor = render(cases=[])
-        self.assertEqual(len(cursor.requests), 1)
-        self.assertTrue(any("No ISO Excel saved" in m for t, m in ui.messages if t == "write"))
-
-    def test_missing_file(self):
-        _, ui, _ = render(docs=[])
-        self.assertTrue(any("ISO Excel file is unavailable" in m for t, m in ui.messages if t == "warning"))
-
-    def test_db_failure_does_not_hide_history(self):
-        _, ui, _ = render(fail=True)
-        self.assertTrue(any("Could not load saved ISO Excel data" in m for t, m in ui.messages if t == "error"))
-        self.assertTrue(any("Revision history" in m for t, m in ui.messages if t == "subheader"))
-
-    def test_non_admin_does_not_query(self):
-        _, ui, cursor = render(role="Requester")
-        self.assertEqual(cursor.requests, [])
-        self.assertTrue(any("Admin access is required" in m for t, m in ui.messages if t == "error"))
-        self.assertEqual(ui.downloads, [])
+def messages(ui, category):
+    return [text for kind, text in ui.messages if kind == category]
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_iso_document_uses_unified_sections():
+    ui, calls = render()
+    assert ui.tabs_seen == [["Overview", "ISO Excel data", "Engineering review", "History"]]
+    assert calls["documents"] == 1
+    assert calls["snapshot"] == [40]
+    assert any("Case Workspace" in text for text in messages(ui, "subheader"))
+
+
+def test_download_original_iso_excel():
+    ui, calls = render()
+    assert calls["files"] == [5]
+    assert ui.downloads == [{
+        "label": "Download ISO Excel", "data": b"PK\x03\x04 source",
+        "filename": "OP13.xlsx",
+        "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }]
+
+
+def test_iso_values_keep_source_cell_and_formula():
+    ui, _ = render()
+    rows = next(table for table in ui.tables if table and isinstance(table[0], dict)
+                and "Original PDF/Excel text" in table[0])
+    assert rows[0]["Field"] == "rated_load_kg"
+    assert rows[0]["Value"] == "1,635"
+    assert rows[0]["Excel sheet"] == "Lift parameters"
+    assert rows[0]["Excel cell"] == "C5"
+    assert rows[0]["Formula"] == "=1000+635"
+    assert rows[0]["Source verified"] is False
+
+
+def test_pending_iso_has_review_options():
+    ui, _ = render()
+    assert ("Decision", ["Choose decision", "Approve comparison", "Reject", "Request changes"]) in ui.controls
+    assert "Engineering comparison review" in messages(ui, "subheader")
+
+
+@pytest.mark.parametrize("choice,status", [
+    ("Approve comparison", "approved"),
+    ("Reject", "rejected"),
+    ("Request changes", "changes_requested"),
+])
+def test_iso_decision_calls_unified_review_service(choice, status):
+    ui, calls = render(decision=choice, submit=True, checked=True, note="Reviewed test workbook")
+    assert calls["reviews"] == [(5, status, "Reviewed test workbook")]
+    assert ui.session_state["unified_review_notice"] == f"Revision 2 {status.replace('_',' ')}."
+
+
+def test_iso_review_requires_source_confirmation():
+    ui, calls = render(decision="Approve comparison", submit=True, checked=False)
+    assert calls["reviews"] == []
+    assert any("checked the original source" in msg for msg in messages(ui, "error"))
+
+
+def test_iso_review_requires_decision():
+    ui, calls = render(decision="Choose decision", submit=True, checked=True)
+    assert calls["reviews"] == []
+    assert any("Choose a review decision" in msg for msg in messages(ui, "error"))
+
+
+@pytest.mark.parametrize("status", ["approved", "rejected", "changes_requested"])
+def test_nonpending_iso_cannot_be_reviewed_again(status):
+    ui, calls = render(status=status)
+    assert calls["reviews"] == []
+    assert ("Decision", ["Choose decision", "Approve comparison", "Reject", "Request changes"]) not in ui.controls
+    assert any("cannot receive another review" in msg for msg in messages(ui, "info"))
+
+
+def test_historical_iso_revision_is_read_only():
+    revisions = [_revision(revision_id=41, revision_no=2), _revision(revision_id=40, revision_no=1)]
+    ui, calls = render(revisions=revisions, revision_selection=40)
+    assert calls["snapshot"] == [40]
+    assert not calls["reviews"]
+    assert any("Historical revisions are read-only" in msg for msg in messages(ui, "info"))
+
+
+def test_empty_workspace_shows_information():
+    ui, calls = render(documents=[])
+    assert calls["cases"] == 1
+    assert calls["documents"] == 0
+    assert any("No documents have been saved" in msg for msg in messages(ui, "info"))
+
+
+def test_file_error_preserves_revision_history():
+    ui, calls = render(file_error=True)
+    assert any("Could not load source document" in msg for msg in messages(ui, "error"))
+    assert "Revision history" in messages(ui, "subheader")
+    assert calls["reviews"] == []
+
+
+def test_workspace_query_error_is_reported():
+    ui, _ = render(load_error=True)
+    assert any("Could not load unified workspace" in msg for msg in messages(ui, "error"))
+
+
+def test_nonadmin_cannot_query_or_download():
+    ui, calls = render(role="Requester")
+    assert "Admin access is required" in messages(ui, "error")
+    assert calls["cases"] == 0
+    assert calls["files"] == []
+    assert calls["reviews"] == []
+
+
+def test_page_has_no_legacy_iso_dependencies():
+    content = PAGE.read_text()
+    for table in ("iso_assessments", "iso_documents", "iso_extracted_values"):
+        assert table not in content
+    for old_api in ("review_iso_assessment", "_saved_iso_assessments", "_saved_iso_details"):
+        assert old_api not in content

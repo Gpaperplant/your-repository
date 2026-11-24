@@ -45,11 +45,23 @@ class FakeCursor:
         self.queries = []
         self.bulk = []
 
-    def __enter__(self): return self
-    def __exit__(self, *_): return False
-    def execute(self, sql, values=()): self.queries.append((sql, values))
-    def executemany(self, sql, values): self.bulk.append((sql, values))
-    def fetchone(self): return self.answers.pop(0) if self.answers else None
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def execute(self, sql, values=()):
+        self.queries.append((sql, values))
+
+    def executemany(self, sql, values):
+        self.bulk.append((sql, values))
+
+    def fetchone(self):
+        sql = " ".join(self.queries[-1][0].split())
+        if sql.startswith("SELECT d.document_id FROM iso_assessments a JOIN project_documents d"):
+            return None
+        return self.answers.pop(0) if self.answers else None
 
 
 class FakeConnection:
@@ -58,19 +70,31 @@ class FakeConnection:
         self.committed = False
         self.rolled_back = False
 
-    def __enter__(self): return self
+    def __enter__(self):
+        return self
+
     def __exit__(self, exc_type, *_):
         self.committed = exc_type is None
         self.rolled_back = exc_type is not None
         return False
-    def cursor(self): return self.cursor_obj
+
+    def cursor(self):
+        return self.cursor_obj
 
 
 def load_repository(conn):
     db = ModuleType("database")
     db.get_connection = lambda: conn
     with override({"database": db}):
-        return load("services.iso_repository", "services/iso_repository.py")
+        repo = load("_isolated_iso_repository_legacy", "services/iso_repository.py")
+    repo.insert_project_document = MagicMock(return_value={
+        "document_id": 301, "case_id": 7, "created": True,
+    })
+    repo.insert_revision = MagicMock(return_value={
+        "revision_id": 401, "document_id": 301, "revision_no": 1,
+    })
+    repo.insert_engineering_values = MagicMock()
+    return repo
 
 
 def load_importer(extracted=None, case=(7, "OP13(L)"), saved=None):
@@ -89,7 +113,7 @@ def load_importer(extracted=None, case=(7, "OP13(L)"), saved=None):
 
     def store(**kwargs):
         calls.append(("save", kwargs))
-        return {"assessment_id": 12, "created": True} if saved is None else saved(**kwargs)
+        return {"document_id": 301, "revision_id": 401, "revision_no": 1, "values_saved": len(extracted), "created": True} if saved is None else saved(**kwargs)
 
     repo_module.save_iso_excel_assessment = store
     with override({"services.iso_excel_extractor": extract_module, "services.iso_repository": repo_module}):
@@ -133,56 +157,11 @@ class ISOImportTests(unittest.TestCase):
 
 
 class ISORepositoryTests(unittest.TestCase):
-    checksum = "a" * 64
+    """Legacy upload assertions moved to test_iso_repository_unified.py.
 
-    def test_first_excel_only_assessment_is_atomic(self):
-        conn = FakeConnection([(7,), None, None, (15,), (24,)])
-        repo = load_repository(conn)
-        saved = repo.save_iso_excel_assessment(7, "OP13 (L)", "OP13.xlsx", b"source", VALUES, self.checksum)
-        self.assertEqual(saved, {"assessment_id": 15, "created": True})
-        self.assertTrue(conn.committed)
-        queries = [sql for sql, _ in conn.cursor_obj.queries]
-        self.assertIn("FOR UPDATE", queries[0])
-        self.assertTrue(any("VALUES (%s, %s, NULL, %s)" in sql for sql in queries))
-        self.assertTrue(any("'iso_excel'" in sql for sql in queries))
-        self.assertEqual(len(conn.cursor_obj.bulk[0][1]), 2)
-        self.assertEqual({row[0] for row in conn.cursor_obj.bulk[0][1]}, {24})
-
-    def test_existing_case_excel_is_deduplicated(self):
-        conn = FakeConnection([(7,), (4, "OP13(L)"), (4,)])
-        repo = load_repository(conn)
-        result = repo.save_iso_excel_assessment(7, "OP13 (L)", "OP13.xlsx", b"source", VALUES, self.checksum)
-        self.assertEqual(result, {"assessment_id": 4, "created": False})
-        self.assertTrue(conn.committed)
-        self.assertFalse(any("INSERT INTO" in sql for sql, _ in conn.cursor_obj.queries))
-
-    def test_case_not_found_rolls_back(self):
-        conn = FakeConnection([None])
-        repo = load_repository(conn)
-        with self.assertRaisesRegex(ValueError, "case not found"):
-            repo.save_iso_excel_assessment(7, "OP13", "OP13.xlsx", b"x", VALUES, self.checksum)
-        self.assertTrue(conn.rolled_back)
-
-    def test_historical_elevator_mismatch_rolls_back(self):
-        conn = FakeConnection([(7,), (2, "OP21")])
-        repo = load_repository(conn)
-        with self.assertRaisesRegex(ValueError, "already contains ISO data"):
-            repo.save_iso_excel_assessment(7, "OP13", "OP13.xlsx", b"x", VALUES, self.checksum)
-        self.assertTrue(conn.rolled_back)
-
-    def test_duplicate_extracted_fields_rejected_before_connect(self):
-        conn = FakeConnection()
-        repo = load_repository(conn)
-        with self.assertRaisesRegex(ValueError, "Duplicate or invalid"):
-            repo.save_iso_excel_assessment(7, "OP13", "OP13.xlsx", b"x", VALUES * 2, self.checksum)
-        self.assertEqual(conn.cursor_obj.queries, [])
-
-    def test_invalid_checksum_rejected_before_connect(self):
-        conn = FakeConnection()
-        repo = load_repository(conn)
-        with self.assertRaisesRegex(ValueError, "checksum"):
-            repo.save_iso_excel_assessment(7, "OP13", "OP13.xlsx", b"x", VALUES, "bad")
-        self.assertFalse(conn.cursor_obj.queries)
+    Only pure helpers and the historical migration remain here. ISO upload
+    persistence is now checked against the new project_documents contract.
+    """
 
     def test_numeric_values_do_not_turn_text_into_zero(self):
         repo = load_repository(FakeConnection())
@@ -195,8 +174,6 @@ class ISORepositoryTests(unittest.TestCase):
         self.assertIn("ALTER COLUMN pdf_sha256 DROP NOT NULL", sql)
         self.assertIn("WHERE pdf_sha256 IS NULL", sql)
         self.assertNotIn("DROP TABLE", sql.upper())
-
-
 
 
 class ISOApprovalTests(unittest.TestCase):
@@ -275,6 +252,7 @@ class ISOApprovalTests(unittest.TestCase):
         self.assertIn("review_status IN ('pending', 'approved', 'rejected')", sql)
         self.assertNotIn("DROP TABLE", sql)
         self.assertNotIn("TRUNCATE", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

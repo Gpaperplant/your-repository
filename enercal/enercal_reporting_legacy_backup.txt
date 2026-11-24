@@ -1,0 +1,315 @@
+"""Approved Cases Overview using only unified engineering document snapshots.
+
+The records in this dashboard are engineering estimates, not metered savings.
+A comparison-only approval and a test fixture are visibly distinguished from
+full source-verified real evidence. Legacy MOD/ISO tables are not queried.
+"""
+
+from decimal import Decimal
+
+import pandas as pd
+import streamlit as st
+
+from services.unified_kpi_reporting import (
+    case_readiness,
+    iso_annual_energy,
+    iso_saving,
+    load_case_statuses,
+    load_iso_reports,
+    load_reports,
+)
+
+
+METRICS = (
+    ("energy", "Annual energy"),
+    ("regen", "Regenerative energy"),
+    ("annual_cost", "Annual electricity cost"),
+    ("lifetime_cost", "Lifetime electricity cost"),
+    ("operational_co2e", "Operational CO₂e"),
+    ("embodied_co2e", "Embodied CO₂e"),
+)
+
+
+def display(value):
+    if value is None or value == "":
+        return "N/A"
+    if isinstance(value, (Decimal, float, int)):
+        number = Decimal(str(value))
+        if not number.is_finite():
+            return "N/A"
+        formatted = format(number, ",f")
+        return formatted.rstrip("0").rstrip(".") if "." in formatted else formatted
+    return str(value)
+
+
+def display_two(value):
+    return f"{value:,.2f}" if value is not None else "N/A"
+
+
+def difference(before, after):
+    return before - after if before is not None and after is not None else None
+
+
+def metric_unit(key, report):
+    currency = report["currency_symbol"] or "Currency unspecified"
+    years = report["lifetime_years"]
+    return {
+        "energy": "kWh/year",
+        "regen": "kWh/year",
+        "annual_cost": f"{currency}/year",
+        "lifetime_cost": f"{currency}/lifetime",
+        "operational_co2e": f"kg CO₂e over {years} years" if years else "kg CO₂e",
+        "embodied_co2e": "kg CO₂e",
+    }[key]
+
+
+def comparable_unit(key, reports):
+    if not reports:
+        return False, "No approved comparisons."
+    if key in {"annual_cost", "lifetime_cost", "operational_co2e"} and len({
+        metric_unit(key, r) for r in reports
+    }) != 1:
+        return False, "Reports have different currencies or assessment periods."
+    if key in {"annual_cost", "lifetime_cost"} and any(
+        not r["currency_symbol"] for r in reports
+    ):
+        return False, "A report does not specify its currency."
+    if key in {"lifetime_cost", "operational_co2e"} and any(
+        not r["lifetime_years"] for r in reports
+    ):
+        return False, "A report does not specify its assessment lifetime."
+    return True, ""
+
+
+def approval_description(report):
+    if report["source_classification"] != "real":
+        return f"{report['source_classification'].replace('_', ' ').title()} — not real evidence"
+    if not report["real_verified"]:
+        return "Comparison approved — full values not source-verified"
+    return "Real evidence — full values source-verified"
+
+
+def status_label(item, eligible_ids):
+    if item["document_id"] is None:
+        return "No unified MOD PDF"
+    if item["review_status"] is None:
+        return "Extraction missing"
+    if item["review_status"] == "approved" and item["document_id"] not in eligible_ids:
+        return "Approved (KPI data incomplete or inconsistent)"
+    status = str(item["review_status"]).replace("_", " ").title()
+    if item["review_status"] == "approved" and item.get("review_scope") == "comparison_only":
+        return "Approved comparison"
+    return status
+
+
+def show_case_overview(statuses, reports, iso_reports):
+    approved = {r["document_id"] for r in reports}
+    iso_by_case = {r["case_ref"]: r for r in iso_reports}
+    ready = case_readiness(statuses, iso_reports)
+    st.subheader("Modernisation cases and unified evidence")
+    cols = st.columns(6)
+    cols[0].metric("Registered cases", len(statuses))
+    cols[1].metric("Without unified MOD", sum(r["document_id"] is None for r in statuses))
+    cols[2].metric("Pending MOD reviews", sum(r["review_status"] == "pending" for r in statuses))
+    cols[3].metric("Approved MOD estimates", len(reports))
+    cols[4].metric("Cases with ISO Excel", len(iso_reports))
+    cols[5].metric("Both comparisons approved", sum(ready.values()))
+    st.caption(
+        f"Of {len(reports)} approved MOD estimates, "
+        f"{sum(r['real_verified'] for r in reports)} have real, fully source-verified evidence. "
+        "The other estimates must not be reported as verified sustainability results."
+    )
+    if not statuses:
+        st.write("No modernisation cases are registered.")
+        return
+
+    selected_case = st.selectbox(
+        "Filter cases", ["All cases", *sorted(r["case_ref"] for r in statuses)],
+        key="unified_reporting_case",
+    )
+    labels = sorted({status_label(r, approved) for r in statuses})
+    selected_status = st.selectbox(
+        "Filter MOD review status", ["All statuses", *labels],
+        key="unified_reporting_status",
+    )
+    visible = [
+        r for r in statuses
+        if (selected_case == "All cases" or r["case_ref"] == selected_case)
+        and (selected_status == "All statuses" or status_label(r, approved) == selected_status)
+    ]
+    st.caption(f"Showing {len(visible)} of {len(statuses)} registered cases.")
+    st.dataframe([
+        {
+            "Case": row["case_ref"],
+            "Case status": row["case_status"],
+            "MOD document ID": row["document_id"],
+            "MOD PDF": row["filename"] or "",
+            "Source classification": row["source_classification"] or "",
+            "MOD revision": row["revision_no"],
+            "MOD review": status_label(row, approved),
+            "ISO Excel": iso_by_case.get(row["case_ref"], {}).get("filename", ""),
+            "ISO review": (
+                str(iso_by_case[row["case_ref"]]["review_status"]).replace("_", " ").title()
+                if row["case_ref"] in iso_by_case else "Not uploaded"
+            ),
+            "Both comparisons": "Approved" if ready[row["case_ref"]] else "Not approved",
+        }
+        for row in visible
+    ], hide_index=True, width="stretch")
+    st.caption(
+        "Both-comparisons approval only reflects the latest MOD and ISO review decisions; "
+        "it does not establish source verification or measured energy savings."
+    )
+
+
+def show_approved_comparison(reports):
+    if len(reports) < 2:
+        return
+    st.subheader("Compare approved MOD estimates")
+    chosen = st.selectbox("KPI to compare", [label for _, label in METRICS],
+                          key="unified_kpi_choice")
+    key = next(key for key, label in METRICS if label == chosen)
+    compatible, reason = comparable_unit(key, reports)
+    if not compatible:
+        st.warning(reason)
+    rows = []
+    for report in reports:
+        row = {
+            "Case": report["case_ref"],
+            "Document": report["document_id"],
+            "Evidence": approval_description(report),
+            "Estimated saving (%)": display(report["calculated_saving"]),
+        }
+        if compatible:
+            unit = metric_unit(key, report)
+            before, after = report[f"existing_{key}"], report[f"proposed_{key}"]
+            row.update({
+                f"Existing ({unit})": display(before),
+                f"Proposed ({unit})": display(after),
+                f"Difference ({unit})": display(difference(before, after)),
+            })
+        rows.append(row)
+    st.dataframe(rows, hide_index=True, width="stretch")
+    st.caption("Engineering estimates only. Separate lift proposals are not added together.")
+
+
+def show_report_details(reports):
+    if not reports:
+        return
+    st.subheader("Approved MOD estimate details")
+    lookup = {r["document_id"]: r for r in reports}
+    selection = st.selectbox(
+        "Choose approved MOD report", list(lookup),
+        format_func=lambda document_id: (
+            f"{lookup[document_id]['case_ref']} · document {document_id}"
+        ),
+    )
+    report = lookup[selection]
+    if report["real_verified"]:
+        st.success(approval_description(report))
+    else:
+        st.warning(approval_description(report))
+    cols = st.columns(3)
+    saving = display(report["calculated_saving"])
+    cols[0].metric("Estimated saving", f"{saving}%")
+    cols[1].metric(
+        "Estimated annual energy reduction",
+        f"{display(difference(report['existing_energy'], report['proposed_energy']))} kWh/year",
+    )
+    currency = report["currency_symbol"] or "currency unspecified"
+    cols[2].metric(
+        "Estimated annual cost reduction",
+        f"{display(difference(report['existing_annual_cost'], report['proposed_annual_cost']))} {currency}",
+    )
+    st.caption(
+        f"{report['existing_technology']} → {report['proposed_technology']} · "
+        f"{display(report['country'])} · "
+        f"{display(report['lifetime_years'])} years · "
+        f"Revision {report['revision_no']} ({report['review_scope']})"
+    )
+    st.dataframe([
+        {
+            "Measure": label,
+            "Existing": display(report[f"existing_{key}"]),
+            "Proposed": display(report[f"proposed_{key}"]),
+            "Difference": display(difference(report[f"existing_{key}"], report[f"proposed_{key}"])),
+            "Unit": metric_unit(key, report),
+        }
+        for key, label in METRICS
+    ], hide_index=True, width="stretch")
+
+    exported = []
+    for record in reports:
+        exported.append({
+            **record,
+            "evidence_label": approval_description(record),
+            **{
+                f"{key}_difference": difference(record[f"existing_{key}"], record[f"proposed_{key}"])
+                for key, _ in METRICS
+            },
+        })
+    st.download_button(
+        "Download approved MOD estimates (CSV)",
+        data=pd.DataFrame(exported).to_csv(index=False).encode("utf-8-sig"),
+        file_name="unified_approved_mod_estimates.csv", mime="text/csv",
+    )
+
+
+def show_iso_reports(iso_reports, readiness):
+    if not iso_reports:
+        return
+    st.subheader("Latest ISO Excel energy assessments")
+    rows = []
+    for report in sorted(iso_reports, key=lambda r: r["case_ref"]):
+        values = report["values"]
+        rows.append({
+            "Case": report["case_ref"],
+            "ISO document": report["document_id"],
+            "Excel file": report["filename"],
+            "Lift": report["lift_id"],
+            "Before (kWh/year)": display_two(iso_annual_energy(report, "before_")),
+            "After (kWh/year)": display_two(iso_annual_energy(report, "after_")),
+            "ISO estimated saving (%)": display_two(iso_saving(report)),
+            "Before class": display(values.get("before_efficiency_class")),
+            "After class": display(values.get("after_efficiency_class")),
+            "Review status": str(report["review_status"]).replace("_", " ").title(),
+            "Review scope": report["review_scope"] or "",
+            "Evidence class": report["source_classification"],
+            "Both comparisons approved": bool(readiness.get(report["case_ref"])),
+        })
+    st.dataframe(rows, hide_index=True, width="stretch")
+    st.caption(
+        "ISO values are workbook estimates, not verified meter readings. "
+        "Test fixtures and comparison-only reviews are not real verified evidence."
+    )
+    st.download_button(
+        "Download ISO summary (CSV)",
+        data=pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig"),
+        file_name="unified_iso_excel_summary.csv", mime="text/csv",
+    )
+
+
+def main():
+    if st.session_state.get("role") != "Admin":
+        st.error("Admin access is required")
+        st.stop()
+    st.subheader("Approved Cases Overview")
+    st.caption("Unified evidence only — no legacy MOD/ISO records are queried.")
+    try:
+        statuses = load_case_statuses()
+        reports = load_reports()
+        iso_reports = load_iso_reports()
+    except Exception as error:
+        st.error(f"Could not load unified KPI reporting: {error}")
+        st.stop()
+
+    show_case_overview(statuses, reports, iso_reports)
+    if reports:
+        show_approved_comparison(reports)
+        show_report_details(reports)
+    else:
+        st.info("No complete, currently approved MOD estimates in unified evidence.")
+    show_iso_reports(iso_reports, case_readiness(statuses, iso_reports))
+
+
+main()

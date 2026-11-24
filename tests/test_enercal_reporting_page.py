@@ -1,39 +1,43 @@
-"""Test the EnerCal page with simulated Streamlit and database results."""
+"""Regression tests for the FIVE-TABLE Approved Cases Overview.
+
+This replaces the retired legacy-reporting-page tests. It continues to protect
+KPI units, review status, privacy, ISO calculations, and evidence labelling,
+without making queries to old MOD/ISO tables or requiring a live database.
+"""
 
 import importlib.util
 import sys
 import unittest
-from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest.mock import patch
 
-# The real page remains a single file; isolate the database with a test stub.
-_fake_db = ModuleType("database")
-_fake_db.get_connection = lambda: None
+# Pandas imports compiled NumPy dependencies. Import both before temporarily
+# substituting a lightweight Streamlit module (the same precaution as the
+# working unified dashboard tests).
+import numpy as np  # noqa: F401
+import pandas as pd  # noqa: F401
 
-PAGE_PATH = Path(__file__).resolve().parents[1] / "enercal" / "enercal_reporting.py"
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+PAGE = ROOT / "enercal" / "enercal_reporting.py"
 
-
-@contextmanager
-def temporary_modules(replacements):
-    # Restore only the mocked modules, preserving imported dependencies.
-    missing = object()
-    originals = {name: sys.modules.get(name, missing) for name in replacements}
-    sys.modules.update(replacements)
+# Local fixture runner compatibility; in Codespaces, database.py exists.
+if "database" not in sys.modules:
     try:
-        yield
-    finally:
-        for name, original in originals.items():
-            if original is missing:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = original
+        import database  # noqa: F401
+    except ModuleNotFoundError:
+        db_stub = ModuleType("database")
+        db_stub.get_connection = lambda: (_ for _ in ()).throw(RuntimeError("No live DB"))
+        sys.modules["database"] = db_stub
+
+from services import unified_kpi_reporting as repo
 
 
 class PageStopped(Exception):
-    pass
+    """Simulate Streamlit's st.stop without terminating the test process."""
 
 
 class FakeStreamlit(ModuleType):
@@ -44,18 +48,15 @@ class FakeStreamlit(ModuleType):
         self.messages = []
         self.metrics = {}
         self.tables = []
-        self.charts = []
         self.downloads = []
-        self.spacers = []
+        self.choices = []
+        self.charts = []
 
     def stop(self):
         raise PageStopped()
 
-    def error(self, message):
-        self.messages.append(("error", str(message)))
-
-    def info(self, message):
-        self.messages.append(("info", str(message)))
+    def subheader(self, message):
+        self.messages.append(("subheader", str(message)))
 
     def caption(self, message):
         self.messages.append(("caption", str(message)))
@@ -63,697 +64,511 @@ class FakeStreamlit(ModuleType):
     def write(self, message):
         self.messages.append(("write", str(message)))
 
-    def subheader(self, message):
-        self.messages.append(("subheader", str(message)))
+    def error(self, message):
+        self.messages.append(("error", str(message)))
+
+    def warning(self, message):
+        self.messages.append(("warning", str(message)))
+
+    def info(self, message):
+        self.messages.append(("info", str(message)))
+
+    def success(self, message):
+        self.messages.append(("success", str(message)))
+
+    def columns(self, count):
+        return [self] * (count if isinstance(count, int) else len(count))
 
     def metric(self, label, value, **kwargs):
         self.metrics[label] = value
 
-    def columns(self, count):
-        return [self] * count
-
     def dataframe(self, data, **kwargs):
         self.tables.append(data)
 
-    def bar_chart(self, data, **kwargs):
-        self.charts.append((data, kwargs))
-
-    def markdown(self, body, **kwargs):
-        self.spacers.append((body, kwargs))
-
     def selectbox(self, label, options, **kwargs):
-        selection = self.selections.get(label, options[0])
-        if selection not in options:
-            raise AssertionError(f"Selection {selection!r} unavailable in {label!r}")
-        return selection
+        options = list(options)
+        self.choices.append((label, options))
+        selected = self.selections.get(label, options[0])
+        if selected not in options:
+            raise AssertionError(f"Selection {selected!r} absent from {label!r}")
+        return selected
 
     def download_button(self, label, data, file_name, mime, **kwargs):
         self.downloads.append({
-            "label": label, "data": data, "filename": file_name,
+            "label": label, "data": data, "filename": file_name, "mime": mime,
         })
 
-
-class FakeCursor:
-    def __init__(self, statuses, approved, error=None, iso=()):
-        self.statuses = statuses
-        self.approved = approved
-        self.iso = iso
-        self.error = error
-        self.current_rows = []
-        self.description = []
-        self.queries = []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        return False
-
-    def execute(self, query, params=None):
-        self.queries.append((query, params))
-        if self.error is not None:
-            raise self.error
-        normalized = " ".join(query.lower().split())
-        if "from modernisation_cases m" in normalized:
-            rows = self.statuses
-        elif "from enercal_approved_kpis_view" in normalized:
-            rows = self.approved
-        elif "from iso_assessments a" in normalized:
-            rows = self.iso
-        else:
-            raise AssertionError(f"Unexpected SQL: {query}")
-
-        self.description = [SimpleNamespace(name=n) for n in rows[0]] if rows else []
-        self.current_rows = [tuple(row.values()) for row in rows]
-
-    def fetchall(self):
-        return list(self.current_rows)
+    def bar_chart(self, *args, **kwargs):
+        self.charts.append((args, kwargs))
 
 
-class FakeConnection:
-    def __init__(self, cursor):
-        self.cur = cursor
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        return False
-
-    def cursor(self):
-        return self.cur
-
-
-def status(case, document=None, review=None):
-    return {
+def status(case="TEST-MOD-REV-001", document_id=7, review="approved", **changes):
+    source = {
         "case_ref": case,
         "case_status": "registered",
-        "document_id": document,
-        "filename": f"EnerCal_{case}.pdf" if document is not None else None,
-        "revision_no": 1 if document is not None else None,
-        "review_status": review,
+        "document_id": document_id,
+        "filename": "EnerCal.pdf" if document_id is not None else None,
+        "source_classification": "test_fixture" if document_id is not None else None,
+        "revision_no": 2 if document_id is not None else None,
+        "review_scope": "comparison_only" if document_id is not None else None,
+        "review_status": review if document_id is not None else None,
     }
+    return {**source, **changes}
 
 
-def approved_role(case, document, role, saving=Decimal("45")):
-    before = role == "existing"
-    return {
-        "document_id": document,
-        "case_ref": case,
-        "filename": f"EnerCal_{case}.pdf",
-        "revision_no": 1,
-        "country": "Singapore",
-        "report_date": "2026-11-01",
-        "currency_symbol": "$",
-        "lifetime_years": 25,
-        "electricity_price_per_kwh": Decimal("0.20"),
+def report(case="TEST-MOD-REV-001", document_id=7, **changes):
+    source = {
+        "document_id": document_id, "case_ref": case,
+        "filename": "EnerCal.pdf", "revision_id": 9,
+        "revision_no": 2, "review_scope": "comparison_only",
+        "source_classification": "test_fixture",
+        "real_verified": False, "fully_source_verified": False,
+        "country": "Singapore", "report_date": "2026-11-17",
+        "lifetime_years": 25, "currency_symbol": "$",
+        "electricity_price": Decimal("0.2"),
         "electricity_price_unit": "$/kWh",
-        "reported_energy_saving_percent": saving,
-        "calculated_energy_saving_percent": saving,
-        "technology_role": role,
-        "elevator_technology": "Old" if before else "New",
-        "annual_energy_kwh_year": Decimal("10000" if before else "5500"),
-        "regenerative_energy_kwh_year": Decimal("100" if before else "200"),
-        "annual_electricity_cost_per_year": Decimal("2000" if before else "1100"),
-        "lifetime_electricity_cost": Decimal("50000" if before else "27500"),
-        "operational_co2e_kg_lifetime": Decimal("30000" if before else "17000"),
-        "embodied_co2e_kg": Decimal("4000" if before else "5000"),
+        "reported_saving": Decimal("44.8"),
+        "calculated_saving": Decimal("45"),
+        "existing_technology": "Old", "proposed_technology": "New",
+        "existing_energy": Decimal("10000"), "proposed_energy": Decimal("5500"),
+        "existing_regen": Decimal("100"), "proposed_regen": Decimal("200"),
+        "existing_annual_cost": Decimal("2000"),
+        "proposed_annual_cost": Decimal("1100"),
+        "existing_lifetime_cost": Decimal("50000"),
+        "proposed_lifetime_cost": Decimal("27500"),
+        "existing_operational_co2e": Decimal("30000"),
+        "proposed_operational_co2e": Decimal("17000"),
+        "existing_embodied_co2e": Decimal("4000"),
+        "proposed_embodied_co2e": Decimal("5000"),
     }
+    return {**source, **changes}
 
 
-def render(statuses=(), approved=(), role="Admin", selections=None,
-           database_error=None, iso=()):
-    """Execute the real page with stubbed I/O and optional dropdown selections."""
+def iso(case="TEST-MOD-REV-001", **changes):
+    source = {
+        "case_ref": case, "document_id": 12, "filename": "ISO.xlsx",
+        "lift_id": "TEST-LIFT-001", "imported_at": "2026-11-17",
+        "review_status": "approved", "review_scope": "comparison_only",
+        "source_classification": "test_fixture", "revision_no": 1,
+        "values": {
+            "before_annual_energy_kwh": Decimal("41933.0484"),
+            "after_annual_energy_kwh": Decimal("22084.06994"),
+            "before_efficiency_class": "C", "after_efficiency_class": "A",
+        },
+    }
+    return {**source, **changes}
+
+
+def render(statuses=None, reports=None, iso_reports=None, role="Admin", selections=None,
+           fail_at=None):
+    """Render the actual page; stub ONLY repository I/O and Streamlit output."""
+    cases = [status()] if statuses is None else statuses
+    mods = [report()] if reports is None else reports
+    workbooks = [] if iso_reports is None else iso_reports
     ui = FakeStreamlit(role, selections)
-    cursor = FakeCursor(list(statuses), list(approved), database_error, iso)
-    spec = importlib.util.spec_from_file_location("_test_enercal_reporting_page", PAGE_PATH)
-    page = importlib.util.module_from_spec(spec)
-    with temporary_modules({
-        "streamlit": ui,
-        "database": _fake_db,
-    }), patch.object(_fake_db, "get_connection", lambda: FakeConnection(cursor)):
+    calls = {}
+    with patch.dict(sys.modules, {"streamlit": ui}), \
+         patch.object(repo, "load_case_statuses", side_effect=(
+             RuntimeError("DB unavailable") if fail_at == "statuses" else None
+         ), return_value=cases) as case_call, \
+         patch.object(repo, "load_reports", side_effect=(
+             RuntimeError("DB unavailable") if fail_at == "reports" else None
+         ), return_value=mods) as mod_call, \
+         patch.object(repo, "load_iso_reports", side_effect=(
+             RuntimeError("DB unavailable") if fail_at == "iso" else None
+         ), return_value=workbooks) as iso_call:
+        instance = importlib.util.spec_from_file_location("_isolated_unified_kpi_page", PAGE)
+        page = importlib.util.module_from_spec(instance)
         try:
-            spec.loader.exec_module(page)
+            instance.loader.exec_module(page)
         except PageStopped:
             pass
-    return page, ui, cursor
+        calls = {"statuses": case_call, "reports": mod_call, "iso": iso_call}
+    return page, ui, calls
 
 
-class ReportingPageTests(unittest.TestCase):
-    def setUp(self):
-        self.statuses = [
-            status("MOD1001", 53, "approved"),
-            status("MOD1002", 54, "approved"),
-            status("MOD1003", 55, "pending"),
-            status("MOD1004", 56, "pending"),
-            status("MOD1005", 57, "pending"),
-            status("MOD1006"),
-        ]
-
+class TestOverview(unittest.TestCase):
     def test_default_overview_and_counts(self):
-        _, ui, _ = render(self.statuses)
-        self.assertEqual(ui.metrics["Modernisation cases"], 6)
-        self.assertEqual(ui.metrics["Without PDF"], 1)
-        self.assertEqual(ui.metrics["Pending reports"], 3)
-        self.assertEqual(ui.metrics["Approved KPI reports"], 0)
-        self.assertEqual(len(ui.tables[0]), 6)
-        self.assertEqual(ui.tables[0][-1]["Engineering status"], "No PDF uploaded")
+        _, ui, _ = render()
+        self.assertEqual(ui.metrics["Registered cases"], 1)
+        self.assertEqual(ui.metrics["Approved MOD estimates"], 1)
+        self.assertEqual(ui.metrics["Without unified MOD"], 0)
+        self.assertEqual(ui.metrics["Pending MOD reviews"], 0)
+        self.assertEqual(ui.metrics["Cases with ISO Excel"], 0)
+        self.assertEqual(ui.tables[0][0]["Case"], "TEST-MOD-REV-001")
 
-    def test_filter_pending(self):
-        _, ui, _ = render(self.statuses, selections={
-            "Filter engineering review status": "Pending",
-        })
-        self.assertEqual(
-            [x["Case"] for x in ui.tables[0]],
-            ["MOD1003", "MOD1004", "MOD1005"],
-        )
-        self.assertEqual(ui.metrics["Modernisation cases"], 6)
-        self.assertEqual(ui.metrics["Pending reports"], 3)
+    def test_no_unified_mod_is_visible_as_registered_case(self):
+        _, ui, _ = render(statuses=[status(document_id=None)], reports=[])
+        self.assertEqual(ui.metrics["Without unified MOD"], 1)
+        self.assertEqual(ui.tables[0][0]["MOD review"], "No unified MOD PDF")
 
-    def test_filter_one_case_and_approved(self):
-        _, ui, _ = render(self.statuses, selections={
-            "Filter cases by reference": "MOD1001",
-            "Filter engineering review status": "Approved (KPI data unavailable)",
-        })
-        self.assertEqual(len(ui.tables[0]), 1)
-        self.assertEqual(ui.tables[0][0]["Document ID"], 53)
+    def test_pending_mod_count(self):
+        cases = [status("A", 1, "pending"), status("B", 2, "approved")]
+        _, ui, _ = render(statuses=cases, reports=[])
+        self.assertEqual(ui.metrics["Pending MOD reviews"], 1)
 
-    def test_filter_approved_with_complete_kpi(self):
-        approved = [
-            approved_role("MOD1001", 53, role)
-            for role in ("existing", "proposed")
-        ]
-        _, ui, _ = render(self.statuses, approved, selections={
-            "Filter cases by reference": "MOD1001",
-            "Filter engineering review status": "Approved",
-        })
-        self.assertEqual(len(ui.tables[0]), 1)
-        self.assertEqual(ui.tables[0][0]["Case"], "MOD1001")
-        self.assertEqual(ui.tables[0][0]["Engineering status"], "Approved")
-        self.assertEqual(ui.metrics["Approved KPI reports"], 1)
+    def test_case_filter(self):
+        cases = [status("A", 1), status("B", 2)]
+        _, ui, _ = render(statuses=cases, reports=[], selections={"Filter cases": "B"})
+        self.assertEqual([r["Case"] for r in ui.tables[0]], ["B"])
 
-    def test_multiple_pdfs_same_case_still_one_case_metric(self):
-        repeated = [
-            status("MOD1001", 53, "pending"),
-            status("MOD1001", 54, "pending"),
-            status("MOD1002", 55, "pending"),
-        ]
-        _, ui, _ = render(repeated)
-        self.assertEqual(ui.metrics["Modernisation cases"], 2)
-        self.assertEqual(ui.metrics["Pending reports"], 3)
-        self.assertEqual(len(ui.tables[0]), 3)
+    def test_review_status_filter(self):
+        cases = [status("A", 1, "pending"), status("B", 2)]
+        _, ui, _ = render(statuses=cases, reports=[], selections={"Filter MOD review status": "Pending"})
+        self.assertEqual([r["Case"] for r in ui.tables[0]], ["A"])
 
-    def test_no_matches(self):
-        _, ui, _ = render(self.statuses, selections={
-            "Filter cases by reference": "MOD1001",
-            "Filter engineering review status": "Pending",
-        })
-        self.assertFalse(ui.tables)
-        self.assertIn(
-            ("write", "No cases match those status filters."), ui.messages
-        )
-        self.assertEqual(ui.metrics["Modernisation cases"], 6)
+    def test_no_matches_keeps_unfiltered_summary(self):
+        cases = [status("A", 1, "pending"), status("B", 2)]
+        _, ui, _ = render(statuses=cases, reports=[], selections={
+            "Filter cases": "B", "Filter MOD review status": "Pending"})
+        self.assertEqual(ui.tables[0], [])
+        self.assertEqual(ui.metrics["Registered cases"], 2)
 
-    def test_no_pdf_filter(self):
-        _, ui, _ = render(self.statuses, selections={
-            "Filter engineering review status": "No PDF uploaded",
-        })
-        self.assertEqual(len(ui.tables[0]), 1)
-        self.assertEqual(ui.tables[0][0]["Case"], "MOD1006")
+    def test_no_unified_mod_filter(self):
+        cases = [status("A", None), status("B", 2)]
+        _, ui, _ = render(statuses=cases, reports=[], selections={
+            "Filter MOD review status": "No unified MOD PDF"})
+        self.assertEqual([r["Case"] for r in ui.tables[0]], ["A"])
+
+    def test_approved_with_incomplete_kpi_is_labelled(self):
+        _, ui, _ = render(reports=[])
+        self.assertEqual(ui.tables[0][0]["MOD review"],
+                         "Approved (KPI data incomplete or inconsistent)")
+
+    def test_pending_without_extraction_is_labelled(self):
+        _, ui, _ = render(statuses=[status(review=None)], reports=[])
+        self.assertEqual(ui.tables[0][0]["MOD review"], "Extraction missing")
+
+    def test_comparison_approval_is_not_full_approval(self):
+        _, ui, _ = render()
+        self.assertEqual(ui.tables[0][0]["MOD review"], "Approved comparison")
+
+    def test_full_approval_label(self):
+        _, ui, _ = render(statuses=[status(review_scope="full_values")])
+        self.assertEqual(ui.tables[0][0]["MOD review"], "Approved")
 
     def test_empty_database(self):
+        _, ui, _ = render(statuses=[], reports=[])
+        self.assertEqual(ui.metrics["Registered cases"], 0)
+        self.assertTrue(any("No modernisation cases" in m for k, m in ui.messages))
+        self.assertEqual(ui.downloads, [])
+
+    def test_no_case_records_does_not_fabricate_kpis(self):
+        _, ui, _ = render(statuses=[], reports=[])
+        self.assertEqual(ui.metrics["Approved MOD estimates"], 0)
+        self.assertTrue(any(k == "info" and "No complete" in m for k, m in ui.messages))
+
+    def test_iso_status_visible_in_case_overview(self):
+        _, ui, _ = render(iso_reports=[iso(review_status="pending")])
+        self.assertEqual(ui.tables[0][0]["ISO review"], "Pending")
+        self.assertEqual(ui.metrics["Cases with ISO Excel"], 1)
+
+    def test_both_comparisons_approved_is_not_full_verification(self):
+        _, ui, _ = render(iso_reports=[iso()])
+        self.assertEqual(ui.metrics["Both comparisons approved"], 1)
+        self.assertEqual(ui.tables[0][0]["Both comparisons"], "Approved")
+        self.assertTrue(any("does not establish source verification" in m
+                            for k, m in ui.messages if k == "caption"))
+
+    def test_iso_only_approval_is_not_ready(self):
+        _, ui, _ = render(statuses=[status(review="pending")], reports=[], iso_reports=[iso()])
+        self.assertEqual(ui.metrics["Both comparisons approved"], 0)
+
+    def test_mod_only_approval_is_not_ready(self):
         _, ui, _ = render()
-        self.assertEqual(ui.metrics["Modernisation cases"], 0)
-        self.assertTrue(any("No modernisation cases" in m for _, m in ui.messages))
-        self.assertFalse(ui.downloads)
+        self.assertEqual(ui.metrics["Both comparisons approved"], 0)
 
-    def test_non_admin_blocked_before_database(self):
-        _, ui, cursor = render(role="Requester")
-        self.assertFalse(cursor.queries)
-        self.assertIn(("error", "Admin access is required"), ui.messages)
+    def test_case_status_not_missing(self):
+        _, ui, _ = render(statuses=[status(case_status="on_hold")])
+        self.assertEqual(ui.tables[0][0]["Case status"], "on_hold")
 
-    def test_approved_reports_have_table_and_safe_export(self):
-        rows = [
-            approved_role(case, document, role)
-            for case, document in (("MOD1001", 53), ("MOD1002", 54))
-            for role in ("existing", "proposed")
-        ]
-        for row in rows:
-            row["contact_email"] = "private@example.test"
-        _, ui, _ = render(self.statuses, rows)
-        self.assertEqual(ui.metrics["Approved KPI reports"], 2)
-        self.assertFalse(ui.charts)
-        self.assertTrue(any(
-            table and isinstance(table[0], dict)
-            and "Estimated saving (%)" in table[0] for table in ui.tables
-        ))
-        self.assertEqual(len(ui.downloads), 1)
-        csv_data = ui.downloads[0]["data"].decode("utf-8-sig")
-        self.assertIn("MOD1001", csv_data)
-        self.assertIn("MOD1002", csv_data)
-        self.assertNotIn("private@example.test", csv_data)
-        self.assertNotIn("contact_email", csv_data)
 
-    def test_incomplete_approved_report_excluded_from_kpis(self):
-        incomplete = [approved_role("MOD1001", 53, "existing")]
-        _, ui, _ = render(self.statuses, incomplete)
-        self.assertEqual(ui.metrics["Approved KPI reports"], 0)
-        self.assertEqual(
-            ui.tables[0][0]["Engineering status"],
-            "Approved (KPI data unavailable)",
-        )
+class TestKPIPage(unittest.TestCase):
+    def test_estimated_kpi_metrics_preserve_units(self):
+        _, ui, _ = render()
+        self.assertEqual(ui.metrics["Estimated saving"], "45%")
+        self.assertEqual(ui.metrics["Estimated annual energy reduction"], "4,500 kWh/year")
+        self.assertEqual(ui.metrics["Estimated annual cost reduction"], "900 $")
 
-    def test_incomplete_approval_skips_specification_query(self):
-        _, _, cursor = render(
-            [status("MOD1001", 53, "approved")],
-            [approved_role("MOD1001", 53, "existing")],
-        )
-        self.assertFalse(any(
-            "from enercal_specifications" in query.lower()
-            for query, _ in cursor.queries
-        ))
+    def test_approved_csv_contains_evidence_label(self):
+        _, ui, _ = render()
+        self.assertIn("evidence_label", ui.downloads[0]["data"].decode("utf-8-sig"))
+        self.assertEqual(ui.downloads[0]["filename"], "unified_approved_mod_estimates.csv")
 
-    def test_unknown_review_status_label(self):
-        _, ui, _ = render([status("MOD1007", 60)])
-        self.assertEqual(ui.tables[0][0]["Engineering status"], "Extraction missing")
+    def test_private_contact_not_exported(self):
+        r = report()
+        r["contact_email"] = "private@example.test"
+        r["contact_phone"] = "+65 1234 5678"
+        _, ui, _ = render(reports=[r])
+        csv = ui.downloads[0]["data"].decode("utf-8-sig")
+        self.assertNotIn("private@example.test", csv)
+        self.assertNotIn("1234 5678", csv)
+        self.assertNotIn("contact_email", csv)
 
-    def test_case_filter_without_status_filter(self):
-        _, ui, _ = render(self.statuses, selections={
-            "Filter cases by reference": "MOD1004",
-        })
-        self.assertEqual([row["Case"] for row in ui.tables[0]], ["MOD1004"])
-        self.assertEqual(ui.metrics["Modernisation cases"], 6)
+    def test_test_fixture_warning_visible(self):
+        _, ui, _ = render()
+        self.assertTrue(any(k == "warning" and "Test Fixture" in m for k, m in ui.messages))
+        self.assertIn("0 have real, fully source-verified evidence", " ".join(
+            m for k, m in ui.messages if k == "caption"))
 
-    def test_profile_and_contact_queries_are_removed(self):
-        rows = [approved_role("MOD1001", 53, role) for role in ("existing", "proposed")]
-        for row in rows:
-            row["contact_email"] = "private@example.test"
-            row["project_name"] = "Example Project"
-        _, ui, cursor = render([status("MOD1001", 53, "approved")], rows)
-        self.assertEqual(ui.metrics["Approved KPI reports"], 1)
-        self.assertEqual(len(cursor.queries), 3)
-        self.assertFalse(any(
-            "enercal_specifications" in sql.lower()
-            for sql, _ in cursor.queries
-        ))
-        export = ui.downloads[0]["data"].decode("utf-8-sig")
-        self.assertNotIn("private@example.test", export)
-        self.assertNotIn("contact_email", export)
-        self.assertNotIn("Example Project", export)
-        self.assertNotIn("project_name", export)
+    def test_real_verified_evidence_has_success(self):
+        real = report(real_verified=True, source_classification="real",
+                      fully_source_verified=True, review_scope="full_values")
+        _, ui, _ = render(reports=[real])
+        self.assertTrue(any(k == "success" and "Real evidence" in m for k, m in ui.messages))
 
-    def test_single_report_selector_replaces_two_dropdowns(self):
-        rows = [approved_role(case, doc, role)
-                for case, doc in (("MOD1001", 53), ("MOD1002", 54))
-                for role in ("existing", "proposed")]
-        _, ui, _ = render(self.statuses, rows, selections={
-            "Choose an approved report": 54,
-        })
-        self.assertEqual(ui.metrics["Approved KPI reports"], 2)
-        self.assertEqual(len(ui.downloads), 1)
-        export = ui.downloads[0]["data"].decode("utf-8-sig")
-        self.assertIn("MOD1001", export)
-        self.assertIn("MOD1002", export)
+    def test_real_comparison_only_is_not_verified(self):
+        real = report(source_classification="real", real_verified=False)
+        _, ui, _ = render(reports=[real])
+        self.assertTrue(any(k == "warning" and "not source-verified" in m
+                            for k, m in ui.messages))
 
-    def test_mixed_currency_is_not_compared(self):
-        page, _, _ = render()
-        comparable, message = page.comparable_unit("annual_cost", [
-            {"currency_symbol": "$", "lifetime_years": 25},
-            {"currency_symbol": "€", "lifetime_years": 25},
-        ])
-        self.assertFalse(comparable)
-        self.assertIn("different currencies", message)
+    def test_no_approved_kpi_does_not_show_success(self):
+        _, ui, _ = render(reports=[])
+        self.assertFalse(any(k == "success" for k, _ in ui.messages))
+        self.assertTrue(any(k == "info" and "No complete" in m for k, m in ui.messages))
 
-    def test_verified_measurement_section_is_removed(self):
-        rows = [approved_role("MOD1001", 53, role)
-                for role in ("existing", "proposed")]
-        _, ui, cursor = render(self.statuses, rows)
-        self.assertNotIn("Eligible verified measurement pairs", ui.metrics)
-        self.assertFalse(any(
-            "Measured vs estimated energy savings" in message
-            for _, message in ui.messages
-        ))
-        self.assertFalse(any(
-            table and isinstance(table[0], dict) and "Pair ID" in table[0]
-            for table in ui.tables
-        ))
-        self.assertFalse(any(
-            "verified_measurement_pairs" in query.lower()
-            for query, _ in cursor.queries
-        ))
+    def test_two_report_comparison_preserves_energy_units(self):
+        r1, r2 = report(), report(case="SECOND", document_id=8)
+        _, ui, _ = render(reports=[r1, r2])
+        comparison = next(t for t in ui.tables if t and "Estimated saving (%)" in t[0])
+        self.assertEqual(comparison[0]["Existing (kWh/year)"], "10,000")
+        self.assertEqual(comparison[0]["Proposed (kWh/year)"], "5,500")
+        self.assertEqual(comparison[0]["Difference (kWh/year)"], "4,500")
 
-    def test_section_spacing_for_approved_reports(self):
-        rows = [approved_role(case, doc, role)
-                for case, doc in (("MOD1001", 53), ("MOD1002", 54))
-                for role in ("existing", "proposed")]
-        _, ui, _ = render(self.statuses, rows)
-        self.assertEqual(len(ui.spacers), 2)
-        for html, props in ui.spacers:
-            self.assertIn("height: 2rem", html)
-            self.assertTrue(props["unsafe_allow_html"])
+    def test_multiple_reports_remain_separate(self):
+        _, ui, _ = render(reports=[report(), report(case="SECOND", document_id=8)])
+        comparison = next(t for t in ui.tables if t and "Estimated saving (%)" in t[0])
+        self.assertEqual(len(comparison), 2)
+        self.assertEqual({r["Case"] for r in comparison}, {"SECOND", "TEST-MOD-REV-001"})
 
-    def test_single_report_has_one_section_gap(self):
-        rows = [approved_role("MOD1001", 53, role)
-                for role in ("existing", "proposed")]
-        _, ui, _ = render(self.statuses, rows)
-        self.assertEqual(len(ui.spacers), 1)
+    def test_mixed_currency_does_not_compare_costs(self):
+        a, b = report(), report(case="SECOND", document_id=8, currency_symbol="€")
+        _, ui, _ = render(reports=[a, b], selections={"KPI to compare": "Annual electricity cost"})
+        comparison = next(t for t in ui.tables if t and "Estimated saving (%)" in t[0])
+        self.assertEqual(set(comparison[0]), {"Case", "Document", "Evidence", "Estimated saving (%)"})
+        self.assertTrue(any(k == "warning" and "different currencies" in m
+                            for k, m in ui.messages))
 
-    def test_units_and_missing_values_are_preserved(self):
-        page, _, _ = render()
-        self.assertEqual(
-            page.metric_unit("annual_cost", {"currency_symbol": "$", "lifetime_years": 25}),
-            "$/year",
-        )
-        self.assertEqual(
-            page.metric_unit("operational_co2e", {"currency_symbol": "$", "lifetime_years": 25}),
-            "kg CO₂e over 25 years",
-        )
-        self.assertEqual(page.display(None), "N/A")
-        self.assertIsNone(page.difference(None, Decimal("12")))
+    def test_matching_currency_compares_annual_cost(self):
+        _, ui, _ = render(reports=[report(), report(case="SECOND", document_id=8)],
+                          selections={"KPI to compare": "Annual electricity cost"})
+        comparison = next(t for t in ui.tables if t and "Estimated saving (%)" in t[0])
+        self.assertEqual(comparison[0]["Difference ($/year)"], "900")
+
+    def test_missing_currency_blocks_comparison(self):
+        page, _, _ = render(reports=[])
+        good = report(currency_symbol="")
+        self.assertFalse(page.comparable_unit("annual_cost", [good])[0])
+
+    def test_mismatched_lifetimes_block_lifetime_costs(self):
+        page, _, _ = render(reports=[])
+        ok, _ = page.comparable_unit("lifetime_cost", [report(), report(lifetime_years=30)])
+        self.assertFalse(ok)
+
+    def test_missing_lifetime_blocks_lifetime_costs(self):
+        page, _, _ = render(reports=[])
+        self.assertFalse(page.comparable_unit("lifetime_cost", [report(lifetime_years=None)])[0])
+
+    def test_different_lifetimes_block_operational_carbon(self):
+        page, _, _ = render(reports=[])
+        self.assertFalse(page.comparable_unit("operational_co2e", [
+            report(), report(lifetime_years=50)])[0])
+
+    def test_missing_comparison_values_display_na(self):
+        a = report(existing_regen=None)
+        b = report(case="SECOND", document_id=8)
+        _, ui, _ = render(reports=[a, b], selections={"KPI to compare": "Regenerative energy"})
+        comparison = next(t for t in ui.tables if t and "Estimated saving (%)" in t[0])
+        self.assertEqual(comparison[0]["Existing (kWh/year)"], "N/A")
+        self.assertEqual(comparison[0]["Difference (kWh/year)"], "N/A")
+
+    def test_missing_details_values_display_na(self):
+        _, ui, _ = render(reports=[report(existing_energy=None, proposed_energy=None,
+                                          existing_annual_cost=None, proposed_annual_cost=None,
+                                          calculated_saving=None)])
+        self.assertTrue(ui.metrics["Estimated saving"].startswith("N/A"))
+        self.assertIn("N/A", ui.metrics["Estimated annual energy reduction"])
+        self.assertIn("N/A", ui.metrics["Estimated annual cost reduction"])
+
+    def test_nonfinite_display_is_na(self):
+        page, _, _ = render(reports=[])
+        for item in (Decimal("NaN"), Decimal("Infinity"), float("inf")):
+            self.assertEqual(page.display(item), "N/A")
+
+    def test_difference_requires_both_values(self):
+        page, _, _ = render(reports=[])
+        self.assertIsNone(page.difference(None, 1))
+        self.assertEqual(page.difference(5, 3), 2)
+
+    def test_decimal_display_retains_precision(self):
+        page, _, _ = render(reports=[])
         self.assertEqual(page.display(Decimal("4213.200")), "4,213.2")
 
+    def test_no_comparison_chart_or_summation(self):
+        _, ui, _ = render(reports=[report(), report(case="SECOND", document_id=8)])
+        self.assertEqual(ui.charts, [])
+        self.assertTrue(any("not added together" in m for k, m in ui.messages if k == "caption"))
+
+    def test_iso_csv_separate_from_mod_csv(self):
+        _, ui, _ = render(iso_reports=[iso()])
+        self.assertEqual([d["filename"] for d in ui.downloads],
+                         ["unified_approved_mod_estimates.csv", "unified_iso_excel_summary.csv"])
+
+    def test_no_iso_export_when_missing(self):
+        _, ui, _ = render()
+        self.assertEqual(len(ui.downloads), 1)
+
+    def test_export_contains_both_reports(self):
+        _, ui, _ = render(reports=[report(), report(case="SECOND", document_id=8)])
+        csv = ui.downloads[0]["data"].decode("utf-8-sig")
+        self.assertIn("TEST-MOD-REV-001", csv)
+        self.assertIn("SECOND", csv)
+
+    def test_metric_unit_labels(self):
+        page, _, _ = render(reports=[])
+        example = report()
+        self.assertEqual(page.metric_unit("annual_cost", example), "$/year")
+        self.assertEqual(page.metric_unit("operational_co2e", example), "kg CO₂e over 25 years")
 
 
-    def test_unreviewed_pdf_has_extraction_missing_status(self):
-        _, ui, _ = render([status("MOD1007", 58)])
-        self.assertEqual(ui.tables[0][0]["Engineering status"], "Extraction missing")
-
-    def test_nonfinite_values_are_not_displayed_as_numbers(self):
-        page, _, _ = render()
-        self.assertEqual(page.display(Decimal("NaN")), "N/A")
-        self.assertEqual(page.display(float("inf")), "N/A")
-        self.assertEqual(page.display(Decimal("-Infinity")), "N/A")
-
-    def test_lifetime_cost_requires_matching_years(self):
-        page, _, _ = render()
-        comparable, reason = page.comparable_unit("lifetime_cost", [
-            {"currency_symbol": "$", "lifetime_years": 20},
-            {"currency_symbol": "$", "lifetime_years": 25},
-        ])
-        self.assertFalse(comparable)
-        self.assertTrue(reason)
-
-    def test_missing_lifetime_blocks_lifetime_cost_comparison(self):
-        page, _, _ = render()
-        comparable, reason = page.comparable_unit("lifetime_cost", [
-            {"currency_symbol": "$", "lifetime_years": None},
-            {"currency_symbol": "$", "lifetime_years": None},
-        ])
-        self.assertFalse(comparable)
-        self.assertTrue(reason)
-
-    def test_missing_currency_blocks_cost_comparison(self):
-        page, _, _ = render()
-        comparable, reason = page.comparable_unit("annual_cost", [
-            {"currency_symbol": "", "lifetime_years": 20},
-            {"currency_symbol": "", "lifetime_years": 20},
-        ])
-        self.assertFalse(comparable)
-        self.assertTrue(reason)
-
-    def test_unexpected_technology_role_is_ignored(self):
-        roles = [
-            approved_role("MOD1001", 53, role)
-            for role in ("existing", "proposed", "unknown")
-        ]
-        _, ui, _ = render(self.statuses, roles)
-        self.assertEqual(ui.metrics["Approved KPI reports"], 1)
-
-    def test_mixed_currency_does_not_create_cost_chart(self):
-        rows = [
-            approved_role(case, doc, role)
-            for case, doc in (("MOD1001", 53), ("MOD1002", 54))
-            for role in ("existing", "proposed")
-        ]
-        for row in rows:
-            if row["document_id"] == 54:
-                row["currency_symbol"] = "€"
-        _, ui, _ = render(self.statuses, rows, selections={
-            "Choose a sustainability KPI": "Annual electricity cost",
-        })
-        self.assertFalse(ui.charts)
-        self.assertTrue(any("different currencies" in msg for kind, msg in ui.messages if kind == "write"))
-
-    def test_missing_comparison_values_do_not_create_kpi_chart(self):
-        rows = [
-            approved_role(case, doc, role)
-            for case, doc in (("MOD1001", 53), ("MOD1002", 54))
-            for role in ("existing", "proposed")
-        ]
-        for row in rows:
-            row["annual_energy_kwh_year"] = None
-        _, ui, _ = render(self.statuses, rows)
-        self.assertFalse(ui.charts)
-        self.assertTrue(any("No usable values" in msg for kind, msg in ui.messages if kind == "write"))
-
-    def test_no_reports_is_not_comparable(self):
-        page, _, _ = render()
-        self.assertEqual(page.comparable_unit("energy", []), (False, ""))
-
-    def test_database_error_does_not_show_partial_results(self):
-        _, ui, _ = render(self.statuses, database_error=RuntimeError("database unavailable"))
-        self.assertTrue(any("database unavailable" in msg for kind, msg in ui.messages if kind == "error"))
-        self.assertFalse(ui.tables)
-
-    def test_valid_kpis_keep_units(self):
-        rows = [approved_role("MOD1001", 53, role) for role in ("existing", "proposed")]
-        _, ui, _ = render(self.statuses, rows)
-        self.assertEqual(ui.metrics["Calculated energy saving"], "45%")
-        self.assertEqual(ui.metrics["Annual energy reduction"], "4,500 kWh/year")
-        self.assertEqual(ui.metrics["Annual electricity cost reduction"], "900 $")
-
-    def test_missing_savings_are_not_charted(self):
-        rows = [
-            approved_role(case, doc, role)
-            for case, doc in (("MOD1001", 53), ("MOD1002", 54))
-            for role in ("existing", "proposed")
-        ]
-        for row in rows:
-            row["calculated_energy_saving_percent"] = None
-        _, ui, _ = render(self.statuses, rows)
-        self.assertFalse(ui.charts)
-
-    def test_missing_numeric_estimates_show_na_without_units(self):
-        rows = [approved_role("MOD1001", 53, role) for role in ("existing", "proposed")]
-        for row in rows:
-            row["calculated_energy_saving_percent"] = None
-            row["annual_energy_kwh_year"] = None
-            row["annual_electricity_cost_per_year"] = None
-        _, ui, _ = render(self.statuses, rows)
-        self.assertEqual(ui.metrics["Calculated energy saving"], "N/A")
-        self.assertEqual(ui.metrics["Annual energy reduction"], "N/A")
-        self.assertEqual(ui.metrics["Annual electricity cost reduction"], "N/A")
-        self.assertFalse(ui.charts)
-
-    def test_reporting_queries_keep_missing_cases_and_approved_view(self):
-        _, _, cursor = render([status("MOD1006")])
-        queries = "\n".join(sql.lower() for sql, _ in cursor.queries)
-        self.assertIn("left join source_documents", queries)
-        self.assertIn("left join lateral", queries)
-        self.assertIn("enercal_approved_kpis_view", queries)
-        self.assertNotIn("from enercal_specifications", queries)
-
-
-    def test_comparison_table_preserves_report_values_and_units(self):
-        rows = [
-            approved_role(case, doc, role)
-            for case, doc in (("MOD1001", 53), ("MOD1002", 54))
-            for role in ("existing", "proposed")
-        ]
-        _, ui, _ = render(self.statuses, rows)
-        comparisons = [
-            table for table in ui.tables
-            if table and "Estimated saving (%)" in table[0]
-        ]
-        self.assertEqual(len(comparisons), 1)
-        self.assertEqual([row["Case"] for row in comparisons[0]], ["MOD1001", "MOD1002"])
-        self.assertEqual(comparisons[0][0]["Existing (kWh/year)"], "10,000")
-        self.assertEqual(comparisons[0][0]["Proposed (kWh/year)"], "5,500")
-        self.assertEqual(comparisons[0][0]["Difference (kWh/year)"], "4,500")
-        self.assertFalse(ui.charts)
-
-    def test_mixed_currency_only_compares_saving_percentages(self):
-        rows = [
-            approved_role(case, doc, role)
-            for case, doc in (("MOD1001", 53), ("MOD1002", 54))
-            for role in ("existing", "proposed")
-        ]
-        for row in rows:
-            if row["document_id"] == 54:
-                row["currency_symbol"] = "€"
-        _, ui, _ = render(self.statuses, rows, selections={
-            "Choose a sustainability KPI": "Annual electricity cost",
-        })
-        comparisons = [
-            table for table in ui.tables
-            if table and "Estimated saving (%)" in table[0]
-        ]
-        self.assertEqual(len(comparisons), 1)
-        self.assertEqual(set(comparisons[0][0]), {"Case", "Report", "Estimated saving (%)"})
-        self.assertTrue(any("different currencies" in msg for kind, msg in ui.messages if kind == "write"))
-        self.assertFalse(ui.charts)
-
-
-
-
-class ISOReportingTests(unittest.TestCase):
-    def setUp(self):
-        self.statuses = [status("MOD1001", 53, "approved"), status("MOD1002")]
-
-    @staticmethod
-    def iso_field(case="MOD1001", field=None, numeric=None, text=None, assessment=4, review="pending"):
-        return {
-            "case_ref": case,
-            "assessment_id": assessment,
-            "lift_id": "OP13 (L)",
-            "imported_at": "2026-11-19",
-            "review_status": review,
-            "filename": "ISO calculation 21Apr25-lot 91.xlsx",
-            "field_name": field,
-            "numeric_value": numeric,
-            "value_text": text,
-        }
-
-    def rows(self):
-        return [
-            self.iso_field(field="before_annual_energy_kwh", numeric=Decimal("41933.0484")),
-            self.iso_field(field="after_annual_energy_kwh", numeric=Decimal("22084.06994")),
-            self.iso_field(field="before_efficiency_class", text="C"),
-            self.iso_field(field="after_efficiency_class", text="A"),
-        ]
-
-    def test_iso_upload_is_visible_in_case_overview(self):
-        _, ui, _ = render(self.statuses, iso=self.rows())
+class TestISOPage(unittest.TestCase):
+    def test_iso_is_visible_without_mod_estimate(self):
+        _, ui, _ = render(reports=[], iso_reports=[iso()])
         self.assertEqual(ui.metrics["Cases with ISO Excel"], 1)
-        self.assertIn("ISO calculation", ui.tables[0][0]["ISO Excel"])
-        self.assertEqual(ui.tables[0][0]["ISO status"], "Pending")
-        self.assertEqual(ui.tables[0][1]["ISO status"], "Not uploaded")
-        self.assertEqual(ui.tables[0][0]["Engineering status"], "Approved (KPI data unavailable)")
+        self.assertTrue(any(k == "subheader" and "ISO Excel" in m for k, m in ui.messages))
+        self.assertEqual(len(ui.downloads), 1)
 
-    def test_iso_section_works_without_approved_enercal(self):
-        _, ui, _ = render(self.statuses, iso=self.rows())
-        self.assertEqual(len(ui.tables), 2)
-        self.assertEqual(ui.tables[1][0]["Case"], "MOD1001")
-        self.assertTrue(any("ISO Excel energy assessments" == m for k, m in ui.messages if k == "subheader"))
-        self.assertTrue(any("No complete engineering-approved EnerCal" in m for k, m in ui.messages))
-        self.assertEqual(len(ui.spacers), 1)
+    def test_iso_before_after_energy_and_class(self):
+        _, ui, _ = render(iso_reports=[iso()])
+        row = ui.tables[-1][0]
+        self.assertEqual(row["Before (kWh/year)"], "41,933.05")
+        self.assertEqual(row["After (kWh/year)"], "22,084.07")
+        self.assertEqual(row["Before class"], "C")
+        self.assertEqual(row["After class"], "A")
 
-    def test_iso_energy_classes_saving_and_csv(self):
-        _, ui, _ = render(self.statuses, iso=self.rows())
-        entry = ui.tables[1][0]
-        self.assertEqual(entry["Before (kWh/year)"], "41,933.05")
-        self.assertEqual(entry["After (kWh/year)"], "22,084.07")
-        self.assertEqual(entry["Before class"], "C")
-        self.assertEqual(entry["After class"], "A")
-        self.assertEqual(entry["ISO saving (%)"], "47.33")
-        self.assertIn("MOD1001", ui.downloads[0]["data"].decode("utf-8-sig"))
-        self.assertEqual(ui.downloads[0]["filename"], "iso_excel_assessments.csv")
+    def test_iso_saving_is_estimated_not_metered(self):
+        _, ui, _ = render(iso_reports=[iso()])
+        self.assertEqual(ui.tables[-1][0]["ISO estimated saving (%)"], "47.33")
+        self.assertTrue(any("not verified meter readings" in m
+                            for k, m in ui.messages if k == "caption"))
 
-    def test_iso_without_before_after_shows_no_saving(self):
-        _, ui, _ = render(self.statuses, iso=[self.iso_field(field="annual_energy_wh", numeric=Decimal("4000000"))])
-        entry = ui.tables[1][0]
-        self.assertEqual(entry["ISO saving (%)"], "N/A")
-        self.assertEqual(entry["Single-column energy (kWh/year)"], "4,000.00")
+    def test_iso_missing_after_energy_is_na(self):
+        _, ui, _ = render(iso_reports=[iso(values={"before_annual_energy_kwh": 100})])
+        self.assertEqual(ui.tables[-1][0]["ISO estimated saving (%)"], "N/A")
 
-    def test_missing_or_zero_before_does_not_divide_by_zero(self):
-        _, ui, _ = render(self.statuses, iso=[
-            self.iso_field(field="before_annual_energy_kwh", numeric=Decimal("0")),
-            self.iso_field(field="after_annual_energy_kwh", numeric=Decimal("120")),
-        ])
-        self.assertEqual(ui.tables[1][0]["ISO saving (%)"], "N/A")
+    def test_iso_zero_before_is_na(self):
+        _, ui, _ = render(iso_reports=[iso(values={
+            "before_annual_energy_kwh": Decimal("0"),
+            "after_annual_energy_kwh": Decimal("60")})])
+        self.assertEqual(ui.tables[-1][0]["ISO estimated saving (%)"], "N/A")
 
-    def test_fallback_to_wh_when_kwh_missing(self):
-        _, ui, _ = render(self.statuses, iso=[
-            self.iso_field(field="before_annual_energy_wh", numeric=Decimal("1000000")),
-            self.iso_field(field="after_annual_energy_wh", numeric=Decimal("700000")),
-        ])
-        entry = ui.tables[1][0]
-        self.assertEqual(entry["Before (kWh/year)"], "1,000.00")
-        self.assertEqual(entry["After (kWh/year)"], "700.00")
-        self.assertEqual(entry["ISO saving (%)"], "30.00")
+    def test_iso_wh_converts_to_kwh(self):
+        _, ui, _ = render(iso_reports=[iso(values={
+            "before_annual_energy_wh": Decimal("1000000"),
+            "after_annual_energy_wh": Decimal("700000")})])
+        row = ui.tables[-1][0]
+        self.assertEqual(row["Before (kWh/year)"], "1,000.00")
+        self.assertEqual(row["After (kWh/year)"], "700.00")
+        self.assertEqual(row["ISO estimated saving (%)"], "30.00")
 
-    def test_iso_is_not_labeled_approved_and_enercal_csv_stays_separate(self):
-        ener = [approved_role("MOD1001", 53, role) for role in ("existing", "proposed")]
-        _, ui, _ = render(self.statuses, ener, iso=self.rows())
-        self.assertEqual(ui.metrics["Approved KPI reports"], 1)
-        self.assertEqual(ui.metrics["Cases with ISO Excel"], 1)
-        self.assertEqual(len(ui.downloads), 2)
-        self.assertEqual(ui.downloads[0]["filename"], "enercal_approved_kpis.csv")
-        self.assertEqual(ui.downloads[1]["filename"], "iso_excel_assessments.csv")
-        self.assertEqual(ui.tables[-1][0]["Evidence status"], "Pending")
-        self.assertEqual(len(ui.spacers), 2)
+    def test_iso_pending_is_not_approved(self):
+        _, ui, _ = render(iso_reports=[iso(review_status="pending")])
+        self.assertEqual(ui.tables[-1][0]["Review status"], "Pending")
+        self.assertEqual(ui.metrics["Both comparisons approved"], 0)
 
-    def test_sql_uses_latest_assessment_and_scoped_fields(self):
-        _, _, cursor = render(self.statuses, iso=self.rows())
-        sql, params = cursor.queries[-1]
-        self.assertIn("latest.case_id = a.case_id", sql)
-        self.assertIn("ORDER BY latest.imported_at DESC, latest.assessment_id DESC", sql)
-        self.assertIn("d.document_type = 'iso_excel'", sql)
-        self.assertIn("before_annual_energy_kwh", params[0])
-        self.assertNotIn("pdf_sha256", sql)
+    def test_iso_rejected_is_not_approved(self):
+        _, ui, _ = render(iso_reports=[iso(review_status="rejected")])
+        self.assertEqual(ui.tables[-1][0]["Review status"], "Rejected")
+        self.assertEqual(ui.metrics["Both comparisons approved"], 0)
 
-    def test_one_iso_assessment_per_case_not_per_field(self):
-        rows = self.rows() + [self.iso_field(case="MOD1002", field="annual_energy_kwh", numeric=Decimal("200"), assessment=5)]
-        _, ui, _ = render(self.statuses, iso=rows)
+    def test_iso_comparison_approval_remains_distinct(self):
+        _, ui, _ = render(iso_reports=[iso()])
+        self.assertEqual(ui.tables[-1][0]["Review scope"], "comparison_only")
+        self.assertEqual(ui.tables[-1][0]["Evidence class"], "test_fixture")
+
+    def test_two_iso_workbooks_one_row_per_case(self):
+        _, ui, _ = render(statuses=[status("A", 1), status("B", 2)],
+                          reports=[], iso_reports=[iso("A"), iso("B", document_id=13)])
         self.assertEqual(ui.metrics["Cases with ISO Excel"], 2)
-        self.assertEqual(len(ui.tables[1]), 2)
+        self.assertEqual(len(ui.tables[-1]), 2)
 
-    def test_pdf_status_filter_does_not_hide_iso_summary(self):
-        _, ui, _ = render(self.statuses, iso=self.rows(), selections={
-            "Filter engineering review status": "No PDF uploaded",
-        })
-        self.assertEqual([r["Case"] for r in ui.tables[0]], ["MOD1002"])
-        self.assertEqual(ui.tables[1][0]["Case"], "MOD1001")
+    def test_iso_summary_csv_keeps_case_label(self):
+        _, ui, _ = render(iso_reports=[iso()])
+        exported = ui.downloads[-1]["data"].decode("utf-8-sig")
+        self.assertIn("TEST-MOD-REV-001", exported)
+        self.assertIn("Evidence class", exported)
 
-    def test_ready_requires_both_approvals_for_same_case(self):
-        approved_iso = [{**row, "review_status": "approved"} for row in self.rows()]
-        _, ui, _ = render(self.statuses, iso=approved_iso)
-        self.assertEqual(ui.metrics["Ready cases"], 1)
-        self.assertEqual(ui.tables[0][0]["Case readiness"], "Ready")
-        self.assertEqual(ui.tables[0][1]["Case readiness"], "Not ready")
-        self.assertEqual(ui.tables[0][0]["ISO status"], "Approved")
-        self.assertEqual(ui.tables[-1][0]["Evidence status"], "Approved")
-        self.assertEqual(ui.tables[-1][0]["Case readiness"], "Ready")
+    def test_iso_status_filter_does_not_hide_summary(self):
+        _, ui, _ = render(statuses=[status("A", 1, "pending"), status("B", None)],
+                          reports=[], iso_reports=[iso("A")], selections={
+                              "Filter MOD review status": "No unified MOD PDF"})
+        self.assertEqual([r["Case"] for r in ui.tables[0]], ["B"])
+        self.assertEqual(ui.tables[-1][0]["Case"], "A")
 
-    def test_only_mod_approved_is_not_ready(self):
-        _, ui, _ = render(self.statuses, iso=self.rows())
-        self.assertEqual(ui.metrics["Ready cases"], 0)
-        self.assertEqual(ui.tables[0][0]["Case readiness"], "Not ready")
+    def test_iso_sql_latest_and_source_scoped(self):
+        sql = repo.ISO_SQL.lower()
+        self.assertIn("max(newest.document_id)", sql)
+        self.assertIn("order by revision_no desc limit 1", sql)
+        self.assertIn("d.document_type = 'iso_excel'", sql)
+        self.assertIn("v.field_name = any(%s)", sql)
 
-    def test_only_iso_approved_is_not_ready(self):
-        pending_mod = [status("MOD1001", 53, "pending")]
-        approved_iso = [{**row, "review_status": "approved"} for row in self.rows()]
-        _, ui, _ = render(pending_mod, iso=approved_iso)
-        self.assertEqual(ui.metrics["Ready cases"], 0)
-        self.assertEqual(ui.tables[0][0]["Case readiness"], "Not ready")
 
-    def test_newer_pending_mod_overrides_older_approved_mod(self):
-        newer = [status("MOD1001", 53, "approved"), status("MOD1001", 54, "pending")]
-        approved_iso = [{**row, "review_status": "approved"} for row in self.rows()]
-        _, ui, _ = render(newer, iso=approved_iso)
-        self.assertEqual(ui.metrics["Ready cases"], 0)
-        self.assertEqual({r["Case readiness"] for r in ui.tables[0]}, {"Not ready"})
+class TestAccessAndSource(unittest.TestCase):
+    def test_non_admin_has_no_repository_calls(self):
+        _, ui, calls = render(role="Requester")
+        self.assertIn(("error", "Admin access is required"), ui.messages)
+        for fn in calls.values():
+            fn.assert_not_called()
 
-    def test_newer_pending_iso_resets_ready_case(self):
-        _, ui, _ = render(self.statuses, iso=self.rows())
-        self.assertEqual(ui.metrics["Ready cases"], 0)
-        self.assertEqual(ui.tables[0][0]["ISO status"], "Pending")
+    def test_status_query_error_prevents_partial_display(self):
+        _, ui, _ = render(fail_at="statuses")
+        self.assertEqual(ui.tables, [])
+        self.assertTrue(any(k == "error" and "DB unavailable" in m for k, m in ui.messages))
 
-    def test_rejected_iso_does_not_grant_ready(self):
-        rejected = [{**row, "review_status": "rejected"} for row in self.rows()]
-        _, ui, _ = render(self.statuses, iso=rejected)
-        self.assertEqual(ui.metrics["Ready cases"], 0)
-        self.assertEqual(ui.tables[0][0]["ISO status"], "Rejected")
+    def test_mod_query_error_prevents_partial_display(self):
+        _, ui, _ = render(fail_at="reports")
+        self.assertEqual(ui.tables, [])
+        self.assertTrue(any(k == "error" and "DB unavailable" in m for k, m in ui.messages))
 
-    def test_no_iso_never_ready(self):
-        _, ui, _ = render(self.statuses)
-        self.assertEqual(ui.metrics["Ready cases"], 0)
-        self.assertEqual(ui.tables[0][0]["Case readiness"], "Not ready")
+    def test_iso_query_error_prevents_partial_display(self):
+        _, ui, _ = render(fail_at="iso")
+        self.assertEqual(ui.tables, [])
+        self.assertTrue(any(k == "error" and "DB unavailable" in m for k, m in ui.messages))
 
-    def test_query_failure_blocks_partial_display(self):
-        _, ui, _ = render(self.statuses, iso=self.rows(), database_error=RuntimeError("ISO database offline"))
-        self.assertFalse(ui.tables)
-        self.assertTrue(any("ISO database offline" in m for k, m in ui.messages if k == "error"))
+    def test_page_has_no_legacy_table_imports(self):
+        code = PAGE.read_text()
+        self.assertIn("services.unified_kpi_reporting", code)
+        self.assertNotIn("from database import", code)
+        for legacy in ("source_documents", "extraction_revisions", "extraction_candidates",
+                       "iso_assessments", "iso_documents", "iso_extracted_values",
+                       "enercal_approved_kpis_view"):
+            self.assertNotIn(legacy, code)
+
+    def test_repository_has_no_legacy_sources_or_writes(self):
+        sql = "\n".join((repo.STATUS_SQL, repo.MOD_SQL, repo.ISO_SQL)).lower()
+        for legacy in ("source_documents", "extraction_revisions", "extraction_candidates",
+                       "iso_assessments", "iso_documents", "iso_extracted_values",
+                       "enercal_approved_kpis_view"):
+            self.assertNotIn(legacy, sql)
+        for table in ("modernisation_cases", "project_documents",
+                      "document_revisions", "engineering_values"):
+            self.assertIn(table, sql)
+        self.assertNotIn("update ", sql)
+        self.assertNotIn("delete ", sql)
+        self.assertNotIn("file_content", sql)
+
+    def test_sql_uses_latest_document_and_revision(self):
+        self.assertIn("MAX(newest.document_id)", repo.MOD_SQL)
+        self.assertIn("MAX(latest.revision_no)", repo.MOD_SQL)
+        self.assertIn("r.review_status = 'approved'", repo.MOD_SQL)
+
+    def test_evidence_fields_preserved_in_export(self):
+        _, ui, _ = render()
+        csv = ui.downloads[0]["data"].decode("utf-8-sig")
+        self.assertIn("source_classification", csv)
+        self.assertIn("review_scope", csv)
+        self.assertIn("real_verified", csv)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,8 @@
-"""ISO-only upload page tests using an isolated Streamlit stub."""
+"""Regression tests for the unified-only ISO Excel Streamlit upload page.
+
+The application is executed with an isolated Streamlit and database-service
+stub. No PostgreSQL data is read or modified by these tests.
+"""
 
 import importlib.util
 import json
@@ -35,15 +39,26 @@ class FakeUI(ModuleType):
     def write(self, msg): self.messages.append(("write", msg))
     def error(self, msg): self.messages.append(("error", msg))
     def warning(self, msg): self.messages.append(("warning", msg))
+    def success(self, msg): self.messages.append(("success", msg))
+    def info(self, msg): self.messages.append(("info", msg))
     def metric(self, label, value): self.metrics[label] = value
     def dataframe(self, rows, **kwargs): self.tables.append(rows)
+
     def file_uploader(self, label, **kwargs):
         self.upload_types.append(kwargs["type"])
         return self.file
-    def download_button(self, label, data, **kwargs): self.exports.append(data)
-    def selectbox(self, label, values, **kwargs): return values[0]
-    def button(self, label, **kwargs): return self.clicked and not kwargs.get("disabled", False)
-    def spinner(self, msg): return nullcontext()
+
+    def download_button(self, label, data, **kwargs):
+        self.exports.append(data)
+
+    def selectbox(self, label, values, **kwargs):
+        return values[0]
+
+    def button(self, label, **kwargs):
+        return self.clicked and not kwargs.get("disabled", False)
+
+    def spinner(self, msg):
+        return nullcontext()
 
 
 @contextmanager
@@ -67,6 +82,7 @@ RECORDS = [
 
 
 def render(file=None, role="Admin", clicked=False, state=None, cases=None, save=None, extract=None):
+    """Execute the real page using only isolated interface/service stubs."""
     ui = FakeUI(FakeFile() if file is None else (None if file is False else file), role, clicked, state)
     calls = {"extract": 0, "save": 0}
     extractor = ModuleType("services.iso_excel_extractor")
@@ -80,17 +96,28 @@ def render(file=None, role="Admin", clicked=False, state=None, cases=None, save=
     def save_file(*args, **kwargs):
         calls["save"] += 1
         return save(*args, **kwargs) if save else {
-            "created": True, "assessment_id": 7, "lift_id": "OP13 (L)", "excel_fields": 2,
+            "created": True,
+            "document_id": 7,
+            "revision_id": 18,
+            "revision_no": 1,
+            "values_saved": 2,
+            "lift_id": "OP13 (L)",
+            "excel_fields": 2,
         }
 
     extractor.extract_iso_excel = extract_file
     importer.MAX_FILE_BYTES = 15 * 1024 * 1024
     importer.process_iso_excel = save_file
     repo.get_cases = lambda: ["MOD1007"] if cases is None else cases
+
     spec = importlib.util.spec_from_file_location("_isolated_iso_upload", PAGE)
     module = importlib.util.module_from_spec(spec)
-    with override({"streamlit": ui, "services.iso_excel_extractor": extractor,
-                   "services.iso_import_service": importer, "services.iso_repository": repo}):
+    with override({
+        "streamlit": ui,
+        "services.iso_excel_extractor": extractor,
+        "services.iso_import_service": importer,
+        "services.iso_repository": repo,
+    }):
         spec.loader.exec_module(module)
     return ui, calls
 
@@ -140,14 +167,27 @@ class ISOExcelPageTests(unittest.TestCase):
         ui, calls = render(clicked=True)
         self.assertEqual(calls, {"extract": 1, "save": 1})
         self.assertEqual(ui.metrics["Excel fields"], 2)
-        self.assertTrue(any(":green[ISO Excel saved" in m for t, m in ui.messages if t == "write"))
+        self.assertTrue(any(
+            "Unified ISO document 7, revision 1 saved" in m
+            for t, m in ui.messages if t == "success"
+        ))
+        self.assertFalse(any("Assessment ID" in m for _, m in ui.messages))
 
     def test_duplicate_save(self):
         ui, calls = render(clicked=True, save=lambda *_: {
-            "created": False, "assessment_id": 2, "lift_id": "OP13 (L)", "excel_fields": 2,
+            "created": False,
+            "document_id": 7,
+            "revision_id": 18,
+            "revision_no": 1,
+            "values_saved": 2,
+            "lift_id": "OP13 (L)",
+            "excel_fields": 2,
         })
         self.assertEqual(calls["save"], 1)
-        self.assertTrue(any("already saved" in m for t, m in ui.messages if t == "write"))
+        self.assertTrue(any(
+            "already saved" in m and "document 7" in m
+            for t, m in ui.messages if t == "info"
+        ))
 
     def test_non_admin_cannot_save(self):
         ui, calls = render(role="Requester", clicked=True)
@@ -159,7 +199,8 @@ class ISOExcelPageTests(unittest.TestCase):
         self.assertEqual(calls["save"], 0)
 
     def test_extraction_failure(self):
-        def invalid(_): raise ValueError("corrupt workbook")
+        def invalid(_):
+            raise ValueError("corrupt workbook")
         ui, calls = render(extract=invalid, clicked=True)
         self.assertEqual(calls["save"], 0)
         self.assertTrue(any("corrupt workbook" in m for t, m in ui.messages if t == "error"))
@@ -172,7 +213,8 @@ class ISOExcelPageTests(unittest.TestCase):
         self.assertEqual([first["extract"], second["extract"], third["extract"]], [1, 0, 1])
 
     def test_database_failure(self):
-        def invalid(*args): raise ValueError("Case elevator does not match")
+        def invalid(*args):
+            raise ValueError("Case elevator does not match")
         ui, calls = render(clicked=True, save=invalid)
         self.assertEqual(calls["save"], 1)
         self.assertTrue(any("does not match" in m for t, m in ui.messages if t == "error"))

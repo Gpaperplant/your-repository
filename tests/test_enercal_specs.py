@@ -1,9 +1,12 @@
+"""Engineering specification extraction and unified MOD comparison regression tests."""
 
 import unittest
+from decimal import Decimal
 
 import pymupdf
 
 from services.enercal_specs import extract_specs
+from services.mod_value_mapper import COMPARISON_FIELDS, map_mod_values
 
 
 def synthetic_report(with_values=True):
@@ -33,7 +36,6 @@ def synthetic_report(with_values=True):
 
 
 class ExtractionTest(unittest.TestCase):
-
     def test_supported_engineering_fields(self):
         values = {
             key: value
@@ -53,14 +55,11 @@ class ExtractionTest(unittest.TestCase):
 
 class UploadCandidatesTest(unittest.TestCase):
     def test_comparison_preserves_sixteen_fields_and_missing_values(self):
-        from decimal import Decimal
-        from services.enercal_extractor import COMPARISON_FIELDS
-        from services.enercal_repository import _comparison_candidates
-
         before = {field: Decimal("10") for field in COMPARISON_FIELDS}
         after = {field: Decimal("5") for field in COMPARISON_FIELDS}
         after["annual_regenerative_energy"] = None
         comparison = {
+            "source_page": 4,
             "currency_symbol": "$",
             "lifetime_years": 25,
             "rows": {
@@ -71,17 +70,37 @@ class UploadCandidatesTest(unittest.TestCase):
             "calculated_energy_saving_percent": Decimal("50.00"),
         }
 
-        rows = _comparison_candidates(comparison)
-        self.assertEqual(len(rows), 16)
-        self.assertEqual(len({row[0] for row in rows}), 16)
-        self.assertEqual(rows[0][:2], ("existing_elevator_technology", "Old"))
-        self.assertEqual(rows[7][:2], ("proposed_elevator_technology", "New"))
-        self.assertEqual(rows[8][0], "proposed_annual_energy_consumption")
-        self.assertEqual(rows[-1][0], "calculated_energy_saving_percent")
-        missing = next(
-            row for row in rows if row[0] == "proposed_annual_regenerative_energy"
+        # The unified MOD mapper replaces the removed legacy candidate helper.
+        records = map_mod_values(comparison, [])
+        self.assertEqual(len(records), 16)
+        self.assertEqual(
+            len({(r["phase"], r["field_name"]) for r in records}), 16
         )
-        self.assertEqual(missing[1:3], ("N/A", None))
+        self.assertEqual(
+            (records[0]["phase"], records[0]["field_name"], records[0]["raw_source_value"]),
+            ("existing", "elevator_technology", "Old"),
+        )
+        self.assertEqual(
+            (records[7]["phase"], records[7]["field_name"], records[7]["raw_source_value"]),
+            ("proposed", "elevator_technology", "New"),
+        )
+        self.assertEqual(
+            (records[8]["phase"], records[8]["field_name"]),
+            ("proposed", "annual_energy_consumption"),
+        )
+        self.assertEqual(
+            (records[-1]["phase"], records[-1]["field_name"]),
+            ("common", "calculated_energy_saving_percent"),
+        )
+        missing = next(
+            r for r in records
+            if r["phase"] == "proposed"
+            and r["field_name"] == "annual_regenerative_energy"
+        )
+        self.assertEqual(missing["raw_source_value"], "N/A")
+        self.assertIsNone(missing["numeric_value"])
+        self.assertEqual(missing["source_page"], 4)
+        self.assertTrue(all(r["source_verified"] is False for r in records))
 
 
 if __name__ == "__main__":

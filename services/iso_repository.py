@@ -1,9 +1,12 @@
-"""Store ISO Excel evidence without changing historical assessments."""
-
+import hashlib
 import re
 from decimal import Decimal, InvalidOperation
 
 from database import get_connection
+from services.document_revision_repository import insert_revision
+from services.engineering_value_repository import VALUE_COLUMNS, insert_engineering_values
+from services.iso_value_mapper import map_iso_values
+from services.project_document_repository import insert_project_document
 
 
 def normalise_lift_id(value):
@@ -11,14 +14,14 @@ def normalise_lift_id(value):
 
 
 def get_cases():
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT case_ref FROM modernisation_cases ORDER BY case_ref")
-        return [row[0] for row in cur.fetchall()]
+    with get_connection() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT case_ref FROM modernisation_cases ORDER BY case_ref")
+        return [row[0] for row in cursor.fetchall()]
 
 
 def get_case_elevator(case_ref):
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
+    with get_connection() as connection, connection.cursor() as cursor:
+        cursor.execute(
             """
             SELECT m.case_id, e.elevator_ref
             FROM modernisation_cases m
@@ -27,15 +30,15 @@ def get_case_elevator(case_ref):
             """,
             (case_ref,),
         )
-        row = cur.fetchone()
+        row = cursor.fetchone()
     if row is None:
         raise ValueError("Modernisation case or linked elevator not found.")
     return row
 
 
 def get_latest_iso_assessment(case_ref):
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
+    with get_connection() as connection, connection.cursor() as cursor:
+        cursor.execute(
             """
             SELECT a.assessment_id, a.lift_id, a.imported_at
             FROM iso_assessments a
@@ -46,7 +49,7 @@ def get_latest_iso_assessment(case_ref):
             """,
             (case_ref,),
         )
-        return cur.fetchone()
+        return cursor.fetchone()
 
 
 def _number(value):
@@ -55,15 +58,16 @@ def _number(value):
     try:
         number = Decimal(str(value).replace(",", "").strip())
         return number if number.is_finite() else None
-    except (InvalidOperation, ValueError):
+    except (InvalidOperation, ValueError, TypeError):
         return None
 
 
 def _prepare_values(records):
-    prepared, seen = [], set()
+    prepared = []
+    seen = set()
     for record in records:
         field = record["field"]
-        if not field or field in seen:
+        if not isinstance(field, str) or not field.strip() or field in seen:
             raise ValueError(f"Duplicate or invalid field: {field}")
         seen.add(field)
         value = record.get("value")
@@ -85,101 +89,236 @@ def _prepare_values(records):
     return prepared
 
 
-def save_iso_excel_assessment(case_id, lift_id, filename, file_bytes, records, checksum):
-    """Save an ISO workbook and its values atomically; retain prior assessments."""
-    prepared = _prepare_values(records)
-    if len(checksum) != 64:
+def save_iso_excel_assessment(case_id, lift_id, filename, file_bytes,
+                              records, checksum):
+    """Store one ISO workbook in the five-table schema, atomically.
+
+    The function name is retained for the ISO importer. It returns *unified*
+    document and revision IDs, not a legacy ISO assessment ID. Duplicate
+    uploads return the already-stored IDs without adding another revision.
+    """
+    if isinstance(case_id, bool) or not isinstance(case_id, int) or case_id < 1:
+        raise ValueError("Invalid modernisation case ID.")
+    if not normalise_lift_id(lift_id):
+        raise ValueError("ISO Excel is missing a valid lift reference.")
+    if not isinstance(file_bytes, bytes) or not file_bytes:
+        raise ValueError("Invalid ISO Excel content.")
+    if not isinstance(checksum, str) or checksum != hashlib.sha256(file_bytes).hexdigest():
         raise ValueError("Invalid ISO workbook checksum.")
 
-    with get_connection() as conn, conn.cursor() as cur:
-        # The case lock serializes duplicate checks and assessment creation.
-        cur.execute(
-            "SELECT case_id FROM modernisation_cases WHERE case_id = %s FOR UPDATE",
+    # Retain legacy extractor field-name collision checks, but no legacy writes.
+    _prepare_values(records)
+    lift_refs = [record.get("value") for record in records
+                 if record.get("field") == "lift_id"]
+    if len(lift_refs) != 1 or normalise_lift_id(lift_refs[0]) != normalise_lift_id(lift_id):
+        raise ValueError("ISO extracted lift reference does not match the uploaded lift ID.")
+    values = map_iso_values(records)
+
+    with get_connection() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT m.case_ref, e.elevator_ref
+            FROM modernisation_cases m
+            JOIN elevators e ON e.elevator_id = m.elevator_id
+            WHERE m.case_id = %s
+            FOR UPDATE OF m
+            """,
             (case_id,),
         )
-        if cur.fetchone() is None:
+        case = cursor.fetchone()
+        if case is None:
             raise ValueError("Modernisation case not found.")
+        case_ref, elevator_ref = case
 
-        cur.execute(
+        # Prevent one case from mixing two distinct ISO workbook lift IDs.
+        cursor.execute(
             """
-            SELECT assessment_id, lift_id
-            FROM iso_assessments
-            WHERE case_id = %s
-            ORDER BY imported_at DESC, assessment_id DESC
+            SELECT reported_elevator_ref
+            FROM project_documents
+            WHERE case_id = %s AND document_type = 'iso_excel'
+            ORDER BY document_id DESC
             LIMIT 1
             """,
             (case_id,),
         )
-        latest = cur.fetchone()
-        if latest and normalise_lift_id(latest[1]) != normalise_lift_id(lift_id):
-            raise ValueError(f"This case already contains ISO data for {latest[1]}.")
+        previous = cursor.fetchone()
+        if (previous and normalise_lift_id(previous[0])
+                != normalise_lift_id(lift_id)):
+            raise ValueError(
+                f"This case already contains ISO data for {previous[0]}."
+            )
 
-        cur.execute(
-            """
-            SELECT assessment_id
-            FROM iso_assessments
-            WHERE case_id = %s AND excel_sha256 = %s
-            ORDER BY assessment_id DESC
-            LIMIT 1
-            """,
-            (case_id, checksum),
+        source_classification = (
+            "test_fixture" if elevator_ref.upper().startswith("TEST-LIFT-")
+            else "unknown"
         )
-        existing = cur.fetchone()
-        if existing:
-            return {"assessment_id": existing[0], "created": False}
+        document = insert_project_document(
+            cursor,
+            case_ref=case_ref,
+            document_type="iso_excel",
+            filename=filename,
+            file_bytes=file_bytes,
+            reported_elevator_ref=lift_id,
+            source_classification=source_classification,
+        )
 
-        # NULL distinguishes Excel-only records from historical paired uploads.
-        cur.execute(
-            """
-            INSERT INTO iso_assessments (case_id, lift_id, pdf_sha256, excel_sha256)
-            VALUES (%s, %s, NULL, %s)
-            RETURNING assessment_id
-            """,
-            (case_id, lift_id, checksum),
+        if not document["created"]:
+            cursor.execute(
+                """
+                SELECT r.revision_id, r.revision_no,
+                       (SELECT COUNT(*) FROM engineering_values v
+                        WHERE v.revision_id = r.revision_id) AS value_count
+                FROM document_revisions r
+                WHERE r.document_id = %s
+                ORDER BY r.revision_no DESC
+                LIMIT 1
+                """,
+                (document["document_id"],),
+            )
+            latest = cursor.fetchone()
+            if latest is None:
+                raise RuntimeError("Stored ISO document has no revision.")
+            return {
+                "document_id": document["document_id"],
+                "revision_id": latest[0],
+                "revision_no": latest[1],
+                "values_saved": latest[2],
+                "created": False,
+            }
+
+        revision = insert_revision(
+            cursor, document["document_id"], "comparison_only"
         )
-        assessment_id = cur.fetchone()[0]
-        cur.execute(
-            """
-            INSERT INTO iso_documents (
-                assessment_id, document_type, filename, file_sha256, content
-            ) VALUES (%s, 'iso_excel', %s, %s, %s)
-            RETURNING document_id
-            """,
-            (assessment_id, filename, checksum, file_bytes),
+        inserted = insert_engineering_values(
+            cursor, revision["revision_id"], values
         )
-        document_id = cur.fetchone()[0]
-        cur.executemany(
+        if inserted["values_saved"] != len(values):
+            raise RuntimeError("Incomplete ISO engineering-value snapshot.")
+
+    return {
+        "document_id": document["document_id"],
+        "revision_id": revision["revision_id"],
+        "revision_no": revision["revision_no"],
+        "values_saved": len(values),
+        "created": True,
+    }
+
+
+def _unified_iso_revision(cursor, case_id, assessment_id):
+    cursor.execute(
+        """
+        SELECT d.document_id
+        FROM iso_assessments a
+        JOIN project_documents d
+          ON d.case_id = a.case_id
+         AND d.document_type = 'iso_excel'
+         AND d.file_sha256 = a.excel_sha256
+        WHERE a.case_id = %s AND a.assessment_id = %s
+        """,
+        (case_id, assessment_id),
+    )
+    document = cursor.fetchone()
+    if document is None:
+        return None
+
+    cursor.execute(
+        """
+        SELECT revision_id, review_status, review_scope
+        FROM document_revisions
+        WHERE document_id = %s
+        ORDER BY revision_no DESC
+        LIMIT 1
+        FOR UPDATE
+        """,
+        (document[0],),
+    )
+    revision = cursor.fetchone()
+    if revision is None:
+        raise ValueError("The unified ISO document has no revision.")
+
+    return {
+        "document_id": document[0],
+        "revision_id": revision[0],
+        "review_status": revision[1],
+        "review_scope": revision[2],
+    }
+
+
+def _review_unified_iso(cursor, revision_id, decision, note):
+    cursor.execute(
+        "SELECT review_document_revision(%s, %s, %s, %s, FALSE)",
+        (revision_id, decision, note, None),
+    )
+    event = cursor.fetchone()
+    if event is None or event[0] is None:
+        raise RuntimeError("Unified ISO review event was not created.")
+
+
+def _create_comparison_revision(cursor, current):
+    cursor.execute(
+        f"SELECT {', '.join(VALUE_COLUMNS)} FROM engineering_values "
+        "WHERE revision_id = %s ORDER BY value_id",
+        (current["revision_id"],),
+    )
+    values = [dict(zip(VALUE_COLUMNS, row)) for row in cursor.fetchall()]
+    if not values:
+        raise ValueError("The unified ISO revision has no engineering values.")
+
+    revision = insert_revision(cursor, current["document_id"], "comparison_only")
+    insert_engineering_values(cursor, revision["revision_id"], values)
+    return revision["revision_id"]
+
+
+def _sync_iso_review(cursor, case_id, assessment_id, decision, note):
+    current = _unified_iso_revision(cursor, case_id, assessment_id)
+    if current is None:
+        return
+    if current["review_status"] != "pending":
+        raise ValueError("The unified ISO revision is not pending.")
+
+    revision_id = current["revision_id"]
+    if decision == "approved" and current["review_scope"] == "full_values":
+        cursor.execute(
             """
-            INSERT INTO iso_extracted_values (
-                document_id, field_name, value_text, numeric_value, unit,
-                data_kind, pdf_page, excel_sheet, excel_cell, excel_formula,
-                source_label, source_note
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            SELECT EXISTS (
+                SELECT 1 FROM engineering_values
+                WHERE revision_id = %s AND NOT source_verified
+            )
             """,
-            [(document_id, *values) for values in prepared],
+            (revision_id,),
         )
-    return {"assessment_id": assessment_id, "created": True}
+        result = cursor.fetchone()
+        if result is None:
+            raise RuntimeError("Cannot check ISO source verification.")
+        if result[0]:
+            _review_unified_iso(
+                cursor,
+                revision_id,
+                "further_verification_required",
+                "ISO summary reviewed; field-level verification remains outstanding.",
+            )
+            revision_id = _create_comparison_revision(cursor, current)
+
+    _review_unified_iso(cursor, revision_id, decision, note or None)
 
 
 def review_iso_assessment(case_ref, assessment_id, decision, note=""):
-    """Approve or reject only the latest pending workbook for its case."""
     if decision not in {"approved", "rejected"}:
         raise ValueError("ISO review decision must be approved or rejected.")
     note = str(note or "").strip()
     if decision == "rejected" and not note:
         raise ValueError("Give a reason when rejecting an ISO workbook.")
 
-    with get_connection() as conn, conn.cursor() as cur:
-        # Lock the case so an upload cannot change the latest assessment during review.
-        cur.execute(
+    with get_connection() as connection, connection.cursor() as cursor:
+        cursor.execute(
             "SELECT case_id FROM modernisation_cases WHERE case_ref = %s FOR UPDATE",
             (case_ref,),
         )
-        case = cur.fetchone()
+        case = cursor.fetchone()
         if case is None:
             raise ValueError("Modernisation case not found.")
 
-        cur.execute(
+        cursor.execute(
             """
             SELECT a.assessment_id, a.review_status
             FROM iso_assessments a
@@ -194,13 +333,14 @@ def review_iso_assessment(case_ref, assessment_id, decision, note=""):
             """,
             (case[0],),
         )
-        latest = cur.fetchone()
+        latest = cursor.fetchone()
         if latest is None or latest[0] != assessment_id:
             raise ValueError("Only the latest ISO Excel assessment can be reviewed.")
         if latest[1] != "pending":
             raise ValueError("Only pending ISO Excel assessments can be reviewed.")
 
-        cur.execute(
+        _sync_iso_review(cursor, case[0], assessment_id, decision, note)
+        cursor.execute(
             """
             UPDATE iso_assessments
             SET review_status = %s, review_note = %s, reviewed_at = NOW()
@@ -209,6 +349,6 @@ def review_iso_assessment(case_ref, assessment_id, decision, note=""):
             """,
             (decision, note, assessment_id, case[0]),
         )
-        if cur.fetchone() is None:
+        if cursor.fetchone() is None:
             raise ValueError("ISO assessment was modified before review completed.")
     return decision

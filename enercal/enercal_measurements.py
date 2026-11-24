@@ -1,4 +1,4 @@
-"""Upload ISO Excel energy calculations and save them to a modernisation case."""
+"""Upload ISO Excel energy calculations into the five-table evidence schema."""
 
 import hashlib
 import json
@@ -105,15 +105,21 @@ def main():
         st.error(f"PostgreSQL save failed: {error}")
         return
 
-    message = (
-        "ISO Excel saved to PostgreSQL."
-        if saved["created"] else "This ISO Excel is already saved."
-    )
-    st.write(f":green[{message}]")
-    st.write(f"**Assessment ID:** {saved['assessment_id']}")
+    if saved["created"]:
+        st.success(
+            f'Unified ISO document {saved["document_id"]}, revision '
+            f'{saved["revision_no"]} saved with '
+            f'{saved["values_saved"]} engineering values.'
+        )
+    else:
+        st.info(
+            f'ISO Excel is already saved as unified document '
+            f'{saved["document_id"]}, revision {saved["revision_no"]}.'
+        )
     st.write(f"**Case:** {case_ref}")
     st.write(f"**Elevator:** {saved['lift_id']}")
     st.metric("Excel fields", saved["excel_fields"])
+    st.caption("Review the workbook in Case Workspace; ISO review is comparison-only.")
 
 
 main()

@@ -1,0 +1,347 @@
+"""Unified MOD and ISO case workspace, using the five-table architecture."""
+
+from decimal import Decimal
+
+import pandas as pd
+import pymupdf
+import streamlit as st
+
+from services.unified_review_actions import (
+    CALCULATED_FIELD, FIELD_LABELS,
+    submit_comparison_review,
+    submit_mod_correction,
+)
+from services.unified_case_workspace_repository import (
+    get_document_file,
+    get_revision_snapshot,
+    list_case_documents,
+    list_document_revisions,
+    list_workspace_cases,
+    mod_comparison_from_snapshot,
+)
+
+
+STATUS_LABELS = {
+    "pending": "Pending review",
+    "approved": "Approved",
+    "rejected": "Rejected",
+    "changes_requested": "Changes requested",
+    "further_verification_required": "Further verification required",
+}
+
+DOCUMENT_LABELS = {
+    "mod_pdf": "EnerCal MOD PDF",
+    "iso_excel": "ISO Excel workbook",
+    "iso_test_pdf": "ISO test PDF",
+    "meter_csv": "Meter CSV",
+}
+
+
+def _format(value):
+    if value is None:
+        return "N/A"
+    if isinstance(value, (Decimal, float, int)):
+        number = Decimal(str(value))
+        if not number.is_finite():
+            return "N/A"
+        result = format(number, ",f")
+        return result.rstrip("0").rstrip(".") if "." in result else result
+    return str(value)
+
+
+def _value(item):
+    value = item["numeric_value"]
+    if value is None:
+        value = item["text_value"]
+    return value if value is not None else item["raw_source_value"]
+
+
+def _comparison(snapshot):
+    try:
+        comparison = mod_comparison_from_snapshot(snapshot)
+    except ValueError as error:
+        st.warning(f"Comparison unavailable: {error}")
+        return None
+    table = []
+    for label, name in (
+        ("Elevator technology", "elevator_technology"),
+        ("Annual energy", "annual_energy_consumption"),
+        ("Regenerative energy", "annual_regenerative_energy"),
+        ("Annual electricity cost", "annual_electricity_expenditure"),
+        ("Lifetime electricity cost", "lifetime_electricity_expenditure"),
+        ("Operational CO₂e", "operational_co2e"),
+        ("Embodied CO₂e", "embodied_co2e"),
+    ):
+        before = comparison[f"existing_{name}"]
+        after = comparison[f"proposed_{name}"]
+        table.append({
+            "Measure": label,
+            "Existing": _format(_value(before)),
+            "Proposed": _format(_value(after)),
+            "Unit": before["unit"] or after["unit"] or "",
+        })
+    st.dataframe(table, hide_index=True, width="stretch")
+    return comparison
+
+
+def _summary(snapshot):
+    revision = snapshot["revision"]
+    st.caption(
+        f"{DOCUMENT_LABELS.get(revision['document_type'], revision['document_type'])} · "
+        f"Revision {revision['revision_no']} · {revision['source_classification']}"
+    )
+    a, b, c = st.columns(3)
+    a.metric("Review status", STATUS_LABELS.get(revision["review_status"], revision["review_status"]))
+    b.metric("Review scope", revision["review_scope"].replace("_", " ").title())
+    c.metric("Source-verified fields", f"{sum(v['source_verified'] for v in snapshot['values'])}/{len(snapshot['values'])}")
+    if revision["source_classification"] != "real":
+        st.warning("This document is not classified as real engineering evidence.")
+    st.caption("Comparison approval is not full engineering source verification.")
+
+
+def _show_values(snapshot):
+    values = snapshot["values"]
+    if not values:
+        st.write("This revision has no engineering values.")
+        return
+    phase = st.selectbox("Engineering phase", ["All", "existing", "proposed", "common"])
+    visible = [v for v in values if phase == "All" or v["phase"] == phase]
+    st.dataframe(
+        [{
+            "Phase": v["phase"],
+            "Field": v["field_name"],
+            "Value": _format(_value(v)),
+            "Original PDF/Excel text": v["raw_source_value"] or "",
+            "Unit": v["unit"] or "",
+            "Source page": v["source_page"],
+            "Excel sheet": v["excel_sheet"] or "",
+            "Excel cell": v["excel_cell"] or "",
+            "Formula": v["excel_formula"] or "",
+            "Source verified": v["source_verified"],
+            "Corrected": v["is_corrected"],
+            "Correction reason": v["correction_reason"] or "",
+        } for v in visible],
+        hide_index=True, width="stretch", height=min(640, max(200, 33 * (len(visible) + 1))),
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def _pdf_preview(pdf_bytes, page_number):
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as pdf:
+        if not 1 <= page_number <= len(pdf):
+            raise ValueError("PDF page is out of range.")
+        pixmap = pdf[page_number - 1].get_pixmap(matrix=pymupdf.Matrix(1.4, 1.4), alpha=False)
+        return pixmap.tobytes("png")
+
+
+def _show_source(document):
+    source = get_document_file(document["document_id"])
+    st.download_button(
+        "Download original document", data=source["file_content"],
+        file_name=source["filename"], mime=source["mime_type"],
+        key=f"unified_source_{document['document_id']}",
+    )
+    if document["document_type"] == "mod_pdf":
+        if st.checkbox("Preview MOD PDF page 4", key=f"preview_{document['document_id']}"):
+            try:
+                st.image(_pdf_preview(source["file_content"], 4))
+            except Exception as error:
+                st.error(f"Could not render the PDF: {error}")
+
+
+def _edit_mod(document, snapshot):
+    comparison = mod_comparison_from_snapshot(snapshot)
+    editable = []
+    for name, label in FIELD_LABELS.items():
+        if name == CALCULATED_FIELD:
+            continue
+        item = comparison[name]
+        editable.append({
+            "Field key": name,
+            "Parameter": label,
+            "Original source": item["raw_value"] or "",
+            "Current value": _format(_value(item)),
+            "Corrected value": _format(_value(item)),
+        })
+
+    with st.form(f"unified_correct_{snapshot['revision']['revision_id']}"):
+        edited = st.data_editor(
+            pd.DataFrame(editable),
+            num_rows="fixed", hide_index=True, width="stretch", height=460,
+            disabled=["Field key", "Parameter", "Original source", "Current value"],
+        )
+        reason = st.text_area("Reason for corrections")
+        checked = st.checkbox("I checked the source PDF and documented any intentional test changes")
+        submitted = st.form_submit_button("Create corrected revision")
+    if not submitted:
+        return
+    if not checked:
+        st.error("Review the source PDF before submitting corrections.")
+        return
+    corrected = {row["Field key"]: str(row["Corrected value"]) for row in edited.to_dict("records")}
+    corrected[CALCULATED_FIELD] = str(_value(comparison[CALCULATED_FIELD]))
+    try:
+        result = submit_mod_correction(document["document_id"], corrected, reason)
+    except Exception as error:
+        st.error(f"Correction could not be saved: {error}")
+    else:
+        st.session_state["unified_review_notice"] = (
+            f"Created pending revision {result['revision_no']}. The original revision was preserved."
+        )
+        st.rerun()
+
+
+def _review_controls(document, snapshot, is_latest):
+    revision = snapshot["revision"]
+    if not is_latest:
+        st.info("Historical revisions are read-only.")
+        return
+    if revision["document_type"] not in {"mod_pdf", "iso_excel"}:
+        st.info("This document type is currently read-only in the workspace.")
+        return
+    if revision["review_status"] == "pending":
+        st.subheader("Engineering comparison review")
+        st.caption("Review the original source. Approval here does not mark engineering values source-verified.")
+        with st.form(f"unified_review_{revision['revision_id']}"):
+            decision = st.selectbox("Decision", ["Choose decision", "Approve comparison", "Reject", "Request changes"])
+            note = st.text_area("Review reason or note")
+            checked = st.checkbox("I checked the comparison against the original source")
+            submitted = st.form_submit_button("Submit review", type="primary")
+        if submitted:
+            if not checked:
+                st.error("Confirm that you checked the original source.")
+            elif decision == "Choose decision":
+                st.error("Choose a review decision.")
+            else:
+                status = {
+                    "Approve comparison": "approved", "Reject": "rejected", "Request changes": "changes_requested"
+                }[decision]
+                try:
+                    result = submit_comparison_review(document["document_id"], status, note)
+                except Exception as error:
+                    st.error(f"Review could not be saved: {error}")
+                else:
+                    st.session_state["unified_review_notice"] = (
+                        f"Revision {result['revision_no']} {status.replace('_', ' ')}."
+                    )
+                    st.rerun()
+    else:
+        st.info("This revision cannot receive another review decision.")
+
+    if revision["document_type"] == "mod_pdf" and revision["review_status"] in {
+        "pending", "changes_requested", "further_verification_required"
+    }:
+        if st.checkbox("Correct MOD comparison values", key=f"edit_{revision['revision_id']}"):
+            try:
+                _edit_mod(document, snapshot)
+            except ValueError as error:
+                st.error(f"Correction unavailable: {error}")
+
+
+def _history(revisions, snapshot):
+    st.subheader("Revision history")
+    st.dataframe(
+        [{
+            "Revision": r["revision_no"], "Scope": r["review_scope"],
+            "Status": r["review_status"], "Values": r["value_count"],
+            "Verified": r["verified_count"], "Corrected": r["corrected_count"],
+            "Events": r["review_event_count"], "Created": r["created_at"],
+        } for r in sorted(revisions, key=lambda r: r["revision_no"])],
+        hide_index=True, width="stretch",
+    )
+    st.subheader("Selected revision's review events")
+    if snapshot["reviews"]:
+        st.dataframe(
+            [{
+                "Action": item["action"], "Previous status": item["previous_status"] or "",
+                "New status": item["new_status"], "Reason": item["reason"] or "",
+                "Date": item["created_at"],
+            } for item in snapshot["reviews"]],
+            hide_index=True, width="stretch",
+        )
+    else:
+        st.write("No review events recorded for this revision.")
+
+
+def main():
+    if st.session_state.get("role") != "Admin":
+        st.error("Admin access is required")
+        st.stop()
+        return
+
+    st.subheader("Case Workspace")
+    st.caption("Unified MOD and ISO documents, engineering snapshots and review history")
+    notice = st.session_state.pop("unified_review_notice", None)
+    if notice:
+        st.success(notice)
+
+    try:
+        cases = list_workspace_cases()
+        if not cases:
+            st.info("No documents have been saved in the unified database yet.")
+            return
+        refs = [item["case_ref"] for item in cases]
+        case_ref = st.selectbox("Modernisation case", refs)
+        documents = list_case_documents(case_ref)
+        if not documents:
+            st.info("This case has no unified evidence.")
+            return
+        by_id = {doc["document_id"]: doc for doc in documents}
+        document_id = st.selectbox(
+            "Evidence document", list(by_id),
+            format_func=lambda key: (
+                f"{DOCUMENT_LABELS.get(by_id[key]['document_type'], by_id[key]['document_type'])} "
+                f"· {by_id[key]['filename']} · ID {key}"
+            ),
+        )
+        document = by_id[document_id]
+        revisions = list_document_revisions(document_id)
+        if not revisions:
+            st.warning("The selected document has no engineering revision.")
+            return
+        by_revision = {r["revision_id"]: r for r in revisions}
+        revision_id = st.selectbox(
+            "Revision", list(by_revision),
+            format_func=lambda key: (
+                f"Revision {by_revision[key]['revision_no']} · "
+                f"{STATUS_LABELS.get(by_revision[key]['review_status'], by_revision[key]['review_status'])}"
+            ),
+        )
+        snapshot = get_revision_snapshot(revision_id)
+        if snapshot is None:
+            st.error("Selected engineering revision not found.")
+            return
+    except Exception as error:
+        st.error(f"Could not load unified workspace: {error}")
+        return
+
+    _summary(snapshot)
+    overview_tab, source_tab, review_tab, history_tab = st.tabs(
+        ["Overview", "Source and values", "Engineering review", "History"]
+    )
+    with overview_tab:
+        if document["document_type"] == "mod_pdf":
+            _comparison(snapshot)
+        else:
+            st.write(f"{len(snapshot['values'])} engineering values saved in this revision.")
+    with source_tab:
+        try:
+            _show_source(document)
+        except Exception as error:
+            st.error(f"Could not load source document: {error}")
+        _show_values(snapshot)
+    with review_tab:
+        latest_doc_id = max(
+            item["document_id"] for item in documents
+            if item["document_type"] == document["document_type"]
+        )
+        is_latest = (
+            revision_id == revisions[0]["revision_id"]
+            and document_id == latest_doc_id
+        )
+        _review_controls(document, snapshot, is_latest)
+    with history_tab:
+        _history(revisions, snapshot)
+
+
+main()
