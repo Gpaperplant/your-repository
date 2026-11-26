@@ -12,8 +12,9 @@ dependencies = [
     "pymupdf>=2.0",
     "python-dotenv>=1.2.4",
     "rapidfuzz>=3.14.3",
-    "scikit-learn>=1.9.1",
+    "scikit-learn==1.9.0",
     "streamlit>=1.36.0",
+    "xgboost==3.4.1",
 ]
 
 [tool.uv]

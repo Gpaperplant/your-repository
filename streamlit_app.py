@@ -77,14 +77,9 @@ def build_navigation(role):
                 icon=":material/monitoring:",
             ),
             st.Page(
-                "enercal/enercal_ai_prediction.py",
-                title="AI Savings Prediction",
-                icon=":material/online_prediction:",
-            ),
-            st.Page(
-                "enercal/enercal_ai_training.py",
-                title="AI Model Training",
-                icon=":material/model_training:",
+                "enercal/enercal_ai_engineering12.py",
+                title="AI Dashboard",
+                icon=":material/auto_awesome:",
             ),
         ]
 

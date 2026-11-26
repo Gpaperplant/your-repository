@@ -1,0 +1,289 @@
+[
+  {
+    "document_type": "iso_excel",
+    "phase": "common",
+    "field_name": "acceleration_m_s2",
+    "numeric_value": 0.83,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "common",
+    "field_name": "counterbalance_percent",
+    "numeric_value": 50.0,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "common",
+    "field_name": "door_time_s",
+    "numeric_value": 12.36,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "common",
+    "field_name": "jerk_m_s3",
+    "numeric_value": 1.4,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "common",
+    "field_name": "lift_landing_floors",
+    "numeric_value": 45.0,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "annual_energy_kwh",
+    "numeric_value": 41933.048404578294,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "average_cycle_energy_wh",
+    "numeric_value": 280.1957945597709,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "daily_nonrunning_energy_wh",
+    "numeric_value": 15842.855640117288,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "daily_running_energy_wh",
+    "numeric_value": 99042.20848201502,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "daily_trips_actual",
+    "numeric_value": 511.0,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "efficiency_class",
+    "numeric_value": null,
+    "text_value": "C"
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "energy_per_m_wh",
+    "numeric_value": 0.8155230596175479,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "idle_power_w",
+    "numeric_value": 1050.0,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "reference_ancillary_energy_wh",
+    "numeric_value": 5.5,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "reference_energy_wh",
+    "numeric_value": 490.0,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "reference_main_energy_wh",
+    "numeric_value": 484.5,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "short_ancillary_energy_wh",
+    "numeric_value": 4.5,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "short_cycle_distance_m",
+    "numeric_value": 109.2,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "short_energy_wh",
+    "numeric_value": 345.0,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "short_main_energy_wh",
+    "numeric_value": 340.5,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "standby30_power_w",
+    "numeric_value": 720.0,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "standby5_power_w",
+    "numeric_value": 920.0,
+    "text_value": null
+  },
+  {
+    "document_type": "iso_excel",
+    "phase": "existing",
+    "field_name": "start_stop_energy_wh",
+    "numeric_value": 83.44488188976376,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "common",
+    "field_name": "iso_usage_category",
+    "numeric_value": 5.0,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "common",
+    "field_name": "operating_days_per_year",
+    "numeric_value": 365.0,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "common",
+    "field_name": "served_floors",
+    "numeric_value": 26.0,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "common",
+    "field_name": "starts_per_year",
+    "numeric_value": 547500.0,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "common",
+    "field_name": "travel_distance_m",
+    "numeric_value": 15.0,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "existing",
+    "field_name": "annual_energy_consumption",
+    "numeric_value": 6689.0,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "existing",
+    "field_name": "drive_type",
+    "numeric_value": null,
+    "text_value": "V3F induction"
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "existing",
+    "field_name": "gear",
+    "numeric_value": null,
+    "text_value": "Geared"
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "existing",
+    "field_name": "nominal_load_kg",
+    "numeric_value": 630.0,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "existing",
+    "field_name": "nominal_speed_m_s",
+    "numeric_value": 1.0,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "existing",
+    "field_name": "regenerative_drive",
+    "numeric_value": null,
+    "text_value": "No"
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "existing",
+    "field_name": "roping_suspension_type",
+    "numeric_value": null,
+    "text_value": "1:1"
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "proposed",
+    "field_name": "annual_energy_consumption",
+    "numeric_value": 3358.0,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "proposed",
+    "field_name": "drive_type",
+    "numeric_value": null,
+    "text_value": "V3F induction"
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "proposed",
+    "field_name": "gear",
+    "numeric_value": null,
+    "text_value": "Gearless"
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "proposed",
+    "field_name": "nominal_speed_m_s",
+    "numeric_value": 2.0,
+    "text_value": null
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "proposed",
+    "field_name": "regenerative_drive",
+    "numeric_value": null,
+    "text_value": "Yes"
+  },
+  {
+    "document_type": "mod_pdf",
+    "phase": "proposed",
+    "field_name": "roping_suspension_type",
+    "numeric_value": null,
+    "text_value": "2:1"
+  }
+]
